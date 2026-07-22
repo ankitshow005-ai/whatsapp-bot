@@ -1,0 +1,16 @@
+clear
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+twilio
+requests
+dateparser
+
+# LangChain core + provider integrations
+# You only need to keep the ones you actually use --
+# but having all three lets you swap providers via config.py alone
+langchain-core
+langchain-google-genai
+langchain-groq
+langchain-openai
