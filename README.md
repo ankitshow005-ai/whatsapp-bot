@@ -49,6 +49,7 @@ step        ┌────┼─────────┬──────�
                                        booking.py
 ---
 
+
 # Features
 
 - AI-powered FAQ assistant
@@ -62,6 +63,7 @@ step        ┌────┼─────────┬──────�
 - Human escalation only when required
 
 ---
+
 
 # 📂 Project Structure
 
@@ -79,6 +81,7 @@ step        ┌────┼─────────┬──────�
 | **requirements.txt** | Python dependencies required to run the project. |
 
 ---
+
 
 # How a Message is Processed
 
