@@ -28,28 +28,25 @@ The goal is simple:
 # High Level Architecture
 
 ```
-                 WhatsApp User
-                        │
-                        ▼
-                  Twilio Webhook
-                        │
-                        ▼
-                 FastAPI (main.py)
-                        │
-                        ▼
-               Single LLM Reasoning
-                        │
-        ┌───────────────┼────────────────┐
-        │               │                │
-        ▼               ▼                ▼
-     Answer FAQ     Book Meeting     Escalate
-        │               │
-        │          TidyCal API
+Incoming WhatsApp message
         │
         ▼
-   WhatsApp Reply
-```
-
+Is a booking already in progress for this user?
+        │
+   ┌────┴─────┐
+  YES         NO
+   │           │
+   ▼           ▼
+Continue    classify_message() picks ONE:
+booking          │
+step        ┌────┼─────────┬──────────┬────────────┐
+             ▼    ▼         ▼          ▼            ▼
+         greeting faq  sales_advice booking_intent complex
+             │     │        │            │            │
+          say hi  answer  give advice  START a     escalate to
+                  from KB  (persuasive)  booking     founder with
+                                         flow →       FULL history
+                                       booking.py
 ---
 
 # Features
