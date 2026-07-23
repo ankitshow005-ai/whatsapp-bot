@@ -95,15 +95,23 @@ Decide ONE intent:
                pricing, features, OR a buying-decision question like "should
                I buy this" — answer confidently, ask a follow-up if you need
                more detail, never just punt this to a human).
-- "book"     — user wants to book/schedule a NEW call or demo.
+- "book"     — user wants to book/schedule a NEW call or demo. This ALWAYS
+               applies whenever the user is explicitly asking to book/
+               schedule a call right now — including a follow-up message
+               after something was just escalated (e.g. "about refund" ->
+               escalate, then next message "ok book a call" -> "book", NOT
+               another escalate). Don't let a topic that was escalated
+               earlier pull a clear, explicit booking request back into
+               "escalate" — the user asking again to book is a new,
+               separate intent that should always be honored.
 - "manage_booking" — user wants to cancel or reschedule a call they ALREADY booked.
 - "escalate" — genuinely needs a human: bugs, refunds, complaints, custom
                enterprise pricing negotiation, partnership requests, or
                anything you're truly not confident about. This alerts the
                founder with the conversation and tells the user the team
                will follow up — it does NOT book a call. If the user
-               separately asks to book/schedule a call, use "book" instead
-               (even in the same message, if they clearly ask for both).
+               explicitly asks to book/schedule a call — whether in the
+               same message or a later one — use "book" instead.
 - "out_of_domain" — not about Fynlo at all (e.g. asking about the weather,
                general chit-chat unrelated to the product). Politely decline
                and steer back to what you can help with.
@@ -245,7 +253,14 @@ def escalate_to_owner(user_number: str, reason: str) -> bool:
 
 
 # ── Core routing ──────────────────────────────────────────
-_RATE_LIMIT_HINT_RE = re.compile(r"rate.?limit|429|quota|tokens per day|tpd", re.IGNORECASE)
+# Transient, self-resolving (retry later, no owner action needed):
+_RATE_LIMIT_HINT_RE = re.compile(r"rate.?limit|429|tokens per day|tpd", re.IGNORECASE)
+# Permanent until the owner adds billing/upgrades a plan — waiting doesn't
+# fix this, so it needs a different message AND an owner heads-up:
+_QUOTA_EXHAUSTED_HINT_RE = re.compile(
+    r"free.?tier|free.?quota|allocationquota|payment.?information|"
+    r"insufficient.?quota|billing", re.IGNORECASE,
+)
 
 
 def handle_message(message: str, user_number: str) -> str:
@@ -253,8 +268,22 @@ def handle_message(message: str, user_number: str) -> str:
     try:
         reply = _route(message, user_number)
     except Exception as e:
-        if _RATE_LIMIT_HINT_RE.search(str(e)):
-            # Provider-side quota/rate-limit — expected & recoverable, not a
+        err_str = str(e)
+        if _QUOTA_EXHAUSTED_HINT_RE.search(err_str):
+            # Provider's free tier is exhausted / billing needed — this is
+            # PERMANENT until someone adds payment info, not something that
+            # resolves by waiting. Tell the user something honest (not "try
+            # again shortly", which would be false), and make sure the owner
+            # actually knows to go fix billing, since the bot is fully down
+            # until they do.
+            logger.error(f"LLM provider quota/billing exhausted for {user_number}: {e}")
+            escalate_to_owner(user_number, f"LLM provider quota/billing exhausted — bot is down: {err_str[:200]}")
+            reply = (
+                "Sorry, I'm temporarily unable to answer questions — I've flagged this to our "
+                f"team. For anything urgent, please contact us directly here: {BOOKING_LINK}"
+            )
+        elif _RATE_LIMIT_HINT_RE.search(err_str):
+            # Provider-side rate-limit — expected & self-resolving, not a
             # real bug. Log it (so YOU notice quota is tight) but don't page
             # the owner over it every time, and give the user an honest,
             # less alarming message than "I hit a snag."
