@@ -436,13 +436,18 @@ def _route(message: str, user_number: str) -> str:
                 resume = _STEP_RESUME_HINT.get(step, "")
                 return f"{result['reply']}\n\n{resume}".strip()
             if result["intent"] == "escalate":
-                state.clear_booking(user_number)
+                # Keep the booking alive — the user was already partway
+                # through booking a call, no reason to drop that just
+                # because something escalate-worthy came up along the way.
                 sent = escalate_to_owner(user_number, result.get("reply") or message)
-                if sent:
-                    return "Thanks for flagging that — I've passed it to our team and someone will get back to you shortly. 🙏"
-                return f"I'm having trouble reaching our team's alert system right now — for anything urgent, contact us directly here: {BOOKING_LINK}"
-
-        if step == "query":
+                resume = _STEP_RESUME_HINT.get(step, "")
+                flag_note = (
+                    "I've flagged this to our team so they can look into it properly. "
+                    if sent else
+                    f"I'm having trouble reaching our team's alert system right now — for "
+                    f"anything urgent, contact us directly here: {BOOKING_LINK}. "
+                )
+                return f"{flag_note}{resume}".strip()
             state.update_booking(user_number, "query", message.strip())
 
             # Give the reasoning LLM a shot at just answering this before
@@ -455,11 +460,27 @@ def _route(message: str, user_number: str) -> str:
                 return f"{result['reply']}\n\nWant me to set up a call for this too, or does that cover it?"
 
             if result["intent"] == "escalate":
-                state.clear_booking(user_number)
+                # The user's ORIGINAL intent here was to book a call — a
+                # complex/escalate-worthy query doesn't change that. Flag it
+                # to the owner (with the current conversation state) AND
+                # keep moving toward getting the call actually booked,
+                # instead of dropping the booking flow entirely.
                 sent = escalate_to_owner(user_number, result.get("reply") or message)
-                if sent:
-                    return "Thanks for flagging that — I've passed it to our team and someone will get back to you shortly. 🙏"
-                return f"I'm having trouble reaching our team's alert system right now — for anything urgent, contact us directly here: {BOOKING_LINK}"
+                flag_note = (
+                    "I've flagged this to our team so they can look into it properly. "
+                    if sent else
+                    f"I'm having trouble reaching our team's alert system right now — for "
+                    f"anything urgent, contact us directly here: {BOOKING_LINK}. "
+                )
+
+                if booking.get("name") and booking.get("email"):
+                    booking["step"] = "time"
+                    return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_time()
+                if booking.get("name"):
+                    booking["step"] = "email"
+                    return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_email()
+                booking["step"] = "name"
+                return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_name()
 
             if booking.get("name") and booking.get("email"):
                 booking["step"] = "time"
@@ -545,13 +566,17 @@ def _route(message: str, user_number: str) -> str:
         return _start_booking_flow(user_number, message, rescheduling_id=booking_id)
 
     # intent == "escalate" — genuinely complex stuff (bugs, refunds, custom
-    # enterprise terms, etc). Just notify the owner with the full
-    # conversation and let the user know the team will follow up. If they
-    # separately ask to book a call (now or in a later message), the normal
-    # "book" intent above handles that — escalate doesn't auto-book.
+    # enterprise terms, etc). Notify the owner with the full conversation,
+    # let the user know the team will follow up, AND offer a call as a
+    # faster path — if they take it, their next message naturally becomes
+    # "book" per the prompt rules above.
     sent = escalate_to_owner(user_number, result.get("reply") or message)
     if sent:
-        return "Thanks for reaching out! This needs a closer look — I've flagged it to our team and someone will get back to you shortly. 🙏"
+        return (
+            "Thanks for reaching out! This needs a closer look — I've flagged it to our "
+            "team and someone will get back to you shortly. 🙏 If you'd rather not wait, "
+            "I can also get a call on the calendar for you now — just say the word."
+        )
     return f"Thanks for reaching out! I'm having trouble reaching our team's alert system right now — for anything urgent, please contact us directly here: {BOOKING_LINK}"
 
 
