@@ -36,6 +36,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from config import (
     TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM,
     OWNER_WHATSAPP_NUMBER, BUSINESS_NAME, BOT_NAME, BOOKING_LINK,
+    TWILIO_ESCALATION_TEMPLATE_SID,
 )
 from knowledge_base import FYNLO_KNOWLEDGE
 from llm import ask_llm
@@ -217,7 +218,19 @@ def _summarize_for_escalation(history: str) -> str | None:
 
 
 def escalate_to_owner(user_number: str, reason: str) -> bool:
-    """Sends the founder a WhatsApp alert with context. Returns True if it actually sent."""
+    """
+    Sends the founder a WhatsApp alert with context. Returns True if it
+    actually sent.
+
+    IMPORTANT: WhatsApp only allows FREEFORM business messages within a 24h
+    window after the recipient last messaged you — outside that window,
+    Twilio rejects the send with error 63016. Since the owner may not have
+    texted the bot recently, freeform escalation alerts can silently fail.
+    If TWILIO_ESCALATION_TEMPLATE_SID is set (an approved WhatsApp Message
+    Template's Content SID), that's used instead — templates can be sent
+    anytime, regardless of the 24h window, which is what business-initiated
+    alerts like this actually need.
+    """
     if not OWNER_WHATSAPP_NUMBER:
         logger.error("OWNER_WHATSAPP_NUMBER not set — can't escalate")
         return False
@@ -241,11 +254,30 @@ def escalate_to_owner(user_number: str, reason: str) -> bool:
             # Summary itself somehow ran long — hard cap as a last resort.
             body_middle = body_middle[:budget - 1] + "…"
 
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,
-            to=OWNER_WHATSAPP_NUMBER,
-            body=header + body_middle + footer,
-        )
+        if TWILIO_ESCALATION_TEMPLATE_SID:
+            # Approved template path — works outside the 24h window. The
+            # template must be pre-approved with matching variable slots
+            # (e.g. {{1}}=from, {{2}}=why, {{3}}=summary) in Twilio's
+            # Content Template Builder; adjust the variable keys below to
+            # match however your specific template was defined.
+            twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_FROM,
+                to=OWNER_WHATSAPP_NUMBER,
+                content_sid=TWILIO_ESCALATION_TEMPLATE_SID,
+                content_variables=json.dumps({
+                    "1": user_number,
+                    "2": reason,
+                    "3": body_middle[:1000],  # templates have their own (often tighter) limits
+                }),
+            )
+        else:
+            # Freeform fallback — only actually delivers if the owner has
+            # messaged the bot within the last 24h (error 63016 otherwise).
+            twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_FROM,
+                to=OWNER_WHATSAPP_NUMBER,
+                body=header + body_middle + footer,
+            )
         return True
     except Exception as e:
         logger.error(f"Escalation send failed: {e}")
@@ -448,6 +480,8 @@ def _route(message: str, user_number: str) -> str:
                     f"anything urgent, contact us directly here: {BOOKING_LINK}. "
                 )
                 return f"{flag_note}{resume}".strip()
+
+        if step == "query":
             state.update_booking(user_number, "query", message.strip())
 
             # Give the reasoning LLM a shot at just answering this before

@@ -15,6 +15,15 @@ TWILIO_AUTH_TOKEN     = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM  = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 OWNER_WHATSAPP_NUMBER = os.getenv("OWNER_WHATSAPP_NUMBER", "")  # e.g. "whatsapp:+91XXXXXXXXXX"
 
+# WhatsApp only allows freeform business messages within a 24h window after
+# the recipient last messaged you (error 63016 otherwise). For a reliable
+# escalation alert to the owner (who may not have texted the bot recently),
+# use an APPROVED WhatsApp Message Template instead — set this to that
+# template's Content SID (Twilio Console -> Content Template Builder, after
+# WhatsApp approves it). Leave blank to keep using freeform (only works if
+# the owner has messaged within the last 24h).
+TWILIO_ESCALATION_TEMPLATE_SID = os.getenv("TWILIO_ESCALATION_TEMPLATE_SID", "")
+
 # ── LLM Providers ───────────────────────────────────────────────
 
 # Order in which providers are tried.
