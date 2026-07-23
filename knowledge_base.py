@@ -215,6 +215,9 @@ COMMON FAQs
 Q: What is Fynlo?
 A: An AI-powered invoice processing platform.
 
+Q: What is Website address?
+A: Fynlo.co.in is the website
+
 Q: Who is it for?
 A: Businesses, accountants and finance teams processing invoices.
 

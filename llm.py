@@ -1,61 +1,52 @@
-# llm.py
-# ---------------------------------------------------------
-# One function: send a prompt, get text back. MVP — a single
-# provider (set in config.py), short timeout + one retry so a
-# slow/failing LLM call can't blow past Twilio's ~15s webhook
-# window and cause the user to get no reply at all.
-# ---------------------------------------------------------
 
+"""llm.py - Multi-provider router"""
 import logging
+import re
 from functools import lru_cache
-
 from config import (
-    LLM_PROVIDER,
-    GEMINI_API_KEY, GEMINI_MODEL,
-    GROQ_API_KEY, GROQ_MODEL,
-    OPENAI_API_KEY, OPENAI_MODEL,
-    QWEN_API_KEY, QWEN_MODEL, QWEN_API_BASE,
+    LLM_PRIORITY,
+    GEMINI_API_KEY,GEMINI_MODEL,
+    GROQ_API_KEY,GROQ_MODEL,
+    OPENAI_API_KEY,OPENAI_MODEL,
+    QWEN_API_KEY,QWEN_MODEL,QWEN_API_BASE,
 )
-
-logger = logging.getLogger(__name__)
-
-
-@lru_cache(maxsize=1)
-def _get_client():
-    if LLM_PROVIDER == "gemini":
+logger=logging.getLogger(__name__)
+def _provider_has_key(p):
+    return {"gemini":bool(GEMINI_API_KEY),"groq":bool(GROQ_API_KEY),"openai":bool(OPENAI_API_KEY),"qwen":bool(QWEN_API_KEY)}.get(p,False)
+@lru_cache(maxsize=4)
+def get_client(p):
+    p=p.lower()
+    if p=="gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
-            # Gemini's API rejects deadlines under 10s outright (400
-            # INVALID_ARGUMENT: "Manually set deadline Xs is too short.
-            # Minimum allowed deadline is 10s.") — Groq/OpenAI are fine with
-            # 8s, Gemini specifically needs at least 10.
-            model=GEMINI_MODEL, google_api_key=GEMINI_API_KEY,
-            temperature=0.3, max_retries=1, timeout=10,
-        )
-    if LLM_PROVIDER == "groq":
+        return ChatGoogleGenerativeAI(model=GEMINI_MODEL,google_api_key=GEMINI_API_KEY,temperature=0.3,timeout=10,max_retries=1)
+    if p=="groq":
         from langchain_groq import ChatGroq
-        return ChatGroq(
-            model=GROQ_MODEL, groq_api_key=GROQ_API_KEY,
-            temperature=0.3, max_retries=1, timeout=8,
-        )
-    if LLM_PROVIDER == "openai":
+        return ChatGroq(model=GROQ_MODEL,groq_api_key=GROQ_API_KEY,temperature=0.3,timeout=8,max_retries=1)
+    if p=="openai":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=OPENAI_MODEL, api_key=OPENAI_API_KEY,
-            temperature=0.3, max_retries=1, timeout=8,
-        )
-    if LLM_PROVIDER == "qwen":
-        # DashScope exposes an OpenAI-compatible chat/completions endpoint,
-        # so ChatOpenAI works as-is — just point base_url at DashScope and
-        # pass the Qwen API key instead of an OpenAI one.
+        return ChatOpenAI(model=OPENAI_MODEL,api_key=OPENAI_API_KEY,temperature=0.3,timeout=8,max_retries=1)
+    if p=="qwen":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=QWEN_MODEL, api_key=QWEN_API_KEY, base_url=QWEN_API_BASE,
-            temperature=0.3, max_retries=1, timeout=10,
-        )
-    raise ValueError(f"Unknown LLM_PROVIDER '{LLM_PROVIDER}' — use gemini, groq, openai, or qwen")
-
-
-def ask_llm(prompt: str) -> str:
-    """Send a prompt string, get the raw text response back. Raises on failure — caller handles it."""
-    return _get_client().invoke(prompt).content.strip()
+        return ChatOpenAI(model=QWEN_MODEL,api_key=QWEN_API_KEY,base_url=QWEN_API_BASE,temperature=0.3,timeout=10,max_retries=1)
+    raise ValueError(p)
+def _should_fallback(e):
+    m=str(e).lower()
+    return any(x in m for x in ["429","quota","rate limit","resource exhausted","timeout","timed out","deadline","connection","500","502","503","service unavailable"])
+def ask_llm(prompt:str)->str:
+    last=None
+    for p in LLM_PRIORITY:
+        p=p.lower()
+        if not _provider_has_key(p):
+            logger.info("Skipping %s (no API key)",p);continue
+        try:
+            logger.info("Trying %s",p)
+            r=get_client(p).invoke(prompt)
+            logger.info("%s succeeded",p)
+            return r.content.strip()
+        except Exception as e:
+            last=e
+            logger.warning("%s failed: %s",p,e)
+            if _should_fallback(e):
+                continue
+            raise
+    raise RuntimeError(f"No LLM provider available. Last error: {last}")
