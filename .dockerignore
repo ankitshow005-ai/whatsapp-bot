@@ -1,0 +1,25 @@
+# Virtual Environments
+fynlo_venv/
+venv/
+env/
+.venv/
+
+# Environment Variables (Security)
+.env
+*.env
+
+# Cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
