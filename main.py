@@ -21,7 +21,7 @@ import logging
 import os
 import re
 
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from twilio.rest import Client
@@ -593,6 +593,19 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
     twiml.message(reply_text)
     return PlainTextResponse(content=str(twiml), media_type="application/xml")
 
+# ── Explicit CORS Preflight Handler for Render ───────────
+@app.options("/chat")
+@app.options("/whatsapp/webhook")
+async def options_handler(request: Request):
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
 
 # ── Website chat widget endpoint ──────────────────────────
 @app.post("/chat")
