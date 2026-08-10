@@ -593,15 +593,14 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
     twiml.message(reply_text)
     return PlainTextResponse(content=str(twiml), media_type="application/xml")
 
-# ── Explicit CORS Preflight Handler for Render ───────────
-@app.options("/chat")
-@app.options("/whatsapp/webhook")
-async def options_handler(request: Request):
+# ── Global Preflight Handler for Render Proxy ───────────
+@app.options("/{full_path:path}")
+async def options_handler(request: Request, full_path: str):
     return Response(
         status_code=200,
         headers={
             "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
-            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS, PUT, DELETE",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Allow-Credentials": "true",
         },
