@@ -1,4 +1,3 @@
-
 """llm.py - Multi-provider router"""
 import logging
 import re
@@ -9,10 +8,11 @@ from config import (
     GROQ_API_KEY,GROQ_MODEL,
     OPENAI_API_KEY,OPENAI_MODEL,
     QWEN_API_KEY,QWEN_MODEL,QWEN_API_BASE,
+    MISTRAL_API_KEY,MISTRAL_MODEL,
 )
 logger=logging.getLogger(__name__)
 def _provider_has_key(p):
-    return {"gemini":bool(GEMINI_API_KEY),"groq":bool(GROQ_API_KEY),"openai":bool(OPENAI_API_KEY),"qwen":bool(QWEN_API_KEY)}.get(p,False)
+    return {"gemini":bool(GEMINI_API_KEY),"groq":bool(GROQ_API_KEY),"openai":bool(OPENAI_API_KEY),"qwen":bool(QWEN_API_KEY),"mistral":bool(MISTRAL_API_KEY)}.get(p,False)
 @lru_cache(maxsize=4)
 def get_client(p):
     p=p.lower()
@@ -28,6 +28,9 @@ def get_client(p):
     if p=="qwen":
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(model=QWEN_MODEL,api_key=QWEN_API_KEY,base_url=QWEN_API_BASE,temperature=0.3,timeout=10,max_retries=1)
+    if p=="mistral":
+        from langchain_mistralai import ChatMistralAI
+        return ChatMistralAI(model=MISTRAL_MODEL,api_key=MISTRAL_API_KEY,temperature=0.3,timeout=10,max_retries=1)
     raise ValueError(p)
 def _should_fallback(e):
     m=str(e).lower()

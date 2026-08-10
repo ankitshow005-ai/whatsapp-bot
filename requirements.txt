@@ -1,16 +1,24 @@
-clear
+# --- Web Server & Framework ---
 fastapi
 uvicorn
 python-multipart
-python-dotenv
+
+# --- WhatsApp API ---
 twilio
+
+# --- Upstash (Database & Caching) ---
+upstash-redis
+upstash-semantic-cache
+
+# --- AI & LangChain (Version Pinned for Upstash Compatibility) ---
+langchain<0.3.0
+langchain-core<0.3.0
+langchain-google-genai<2.0.0
+langchain-groq<0.2.0
+langchain-openai<0.2.0
+langchain-mistralai<0.2.0
+
+# --- Utilities ---
+python-dotenv
 requests
 dateparser
-
-# LangChain core + provider integrations
-# You only need to keep the ones you actually use --
-# but having all three lets you swap providers via config.py alone
-langchain-core
-langchain-google-genai
-langchain-groq
-langchain-openai

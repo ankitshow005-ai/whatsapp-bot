@@ -8,16 +8,8 @@
 #   existing booking, escalate to a human, or politely decline
 #   (out of domain) — then main.py acts on that decision.
 #
-# WHY ONE LLM CALL INSTEAD OF SEPARATE CLASSIFIER + FAQ +
-# SALES FILES: for an MVP, understanding the message and
-# answering it are the same piece of reasoning — splitting them
-# into multiple LLM calls just means more API calls, more
-# places to debug, and more chances for the pieces to disagree
-# with each other. One prompt, one JSON response, done.
-#
-# BOOKING is the one part that's genuinely multi-step (need
-# name, email, what it's about, then a time, then hit the real
-# calendar) — that stays a small state machine in `state.py`.
+# Semantic caching via Upstash Vector is layered on top to bypass
+# LLM API calls for frequent/similar user queries.
 #
 # Run locally:
 #   uvicorn main:app --reload --port 8001
@@ -26,12 +18,15 @@
 
 import json
 import logging
+import os
 import re
 
 from fastapi import FastAPI, Request, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
+from upstash_semantic_cache import SemanticCache
 
 from config import (
     TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM,
@@ -40,7 +35,10 @@ from config import (
 )
 from knowledge_base import FYNLO_KNOWLEDGE
 from llm import ask_llm
-from booking import ask_for_name, ask_for_email, ask_for_query, ask_for_time, is_valid_email, attempt_booking, cancel_flow, reschedule_flow
+from booking import (
+    ask_for_name, ask_for_email, ask_for_query, ask_for_time, 
+    is_valid_email, attempt_booking, cancel_flow, reschedule_flow
+)
 from time_parser import parse_preferred_time
 import state
 
@@ -50,8 +48,64 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Fynlo WhatsApp Bot (MVP)")
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+# ── CORS: allow the marketing site (with the ChatWidget) to call this API
+# directly from the browser. Lock ALLOWED_ORIGINS down to your real domain(s)
+# in .env for production — "*" is fine only for local dev.
+_origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
+
+# ── Upstash Semantic Cache Initialization ─────────────────
+UPSTASH_VECTOR_REST_URL = os.getenv("UPSTASH_VECTOR_REST_URL", "")
+UPSTASH_VECTOR_REST_TOKEN = os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
+
+cache = None
+if UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN:
+    try:
+        cache = SemanticCache(
+            url=UPSTASH_VECTOR_REST_URL,
+            token=UPSTASH_VECTOR_REST_TOKEN,
+            min_proximity=0.90, # 0.90 similarity threshold for semantic matches
+        )
+        logger.info("Upstash SemanticCache initialized successfully.")
+    except Exception as e:
+        logger.warning(f"Could not initialize Upstash SemanticCache: {e}")
+else:
+    logger.info("Upstash Vector credentials missing; running without semantic cache.")
+
 _GREETING_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo|sup|good\s*(morning|afternoon|evening)|namaste|hola)\s*[!.?]*\s*$", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"\b(cancel|scrap|drop)\b", re.IGNORECASE)
+_NAME_LEADIN_RE = re.compile(r"^\s*(?:i'?m|i am|it'?s|its|this is|my name'?s|my name is|name'?s|name is|call me)\s+", re.IGNORECASE)
+
+
+def _extract_name(message: str) -> str | None:
+    """
+    Cheap, no-LLM heuristic for pulling a name out of the reply to "what
+    should I call you?". Strips common lead-ins ("I'm ...", "call me ...")
+    and, if what's left is short and doesn't read like a real question or
+    sentence, treats it as the name. Returns None if the message looks like
+    it's actually a question/request instead (so the caller falls through
+    to normal LLM routing rather than mis-storing "pricing?" as a name).
+    """
+    text = message.strip().rstrip(".,!")
+    if not text or "?" in text or len(text) > 30:
+        return None
+    stripped = _NAME_LEADIN_RE.sub("", text).strip()
+    if not stripped:
+        return None
+    words = stripped.split()
+    if len(words) > 3:
+        return None
+    if _QUESTION_HINT_RE.search(stripped) and not _NAME_LEADIN_RE.match(text):
+        return None
+    return stripped.title()
 
 
 @app.get("/health")
@@ -69,11 +123,9 @@ TONE RULES:
   yourself at the start of this conversation — do NOT repeat "I'm {bot},
   from {biz}" in every reply, just answer naturally.
 - Never call yourself an "AI assistant" or "virtual assistant".
-- If the user shared their OWN name earlier in the conversation, address
-  THEM by that name naturally when it fits. Never address the user as
-  "{bot}" — that is YOUR name, not theirs. Do not invent or guess a name
-  for the user if they haven't given one; just don't use a name at all in
-  that case.
+- {name_line}
+- Never use em dashes (—) anywhere in your reply. Use a comma, period, or
+  "and" instead.
 
 KNOWLEDGE BASE (use this to answer questions, including sales/"should I buy"
 questions — be a helpful, confident sales rep using the SALES GUIDANCE and
@@ -132,23 +184,51 @@ Respond with ONLY valid JSON, nothing else:
   human — this is NOT shown to the user, it's shown to the founder."""
 
 
-def _understand_and_respond(message: str, history: str) -> dict:
+def _understand_and_respond(message: str, history: str, user_number: str) -> dict:
+    # 1. Try to fetch from Upstash Semantic Cache first
+    if cache:
+        try:
+            cached_raw = cache.get(message)
+            if cached_raw:
+                logger.info("Semantic Cache HIT! Bypassing LLM API call.")
+                parsed_cache = _parse_understand_response(cached_raw)
+                if parsed_cache.get("intent") in ("answer", "book", "manage_booking", "out_of_domain"):
+                    return parsed_cache
+        except Exception as e:
+            logger.warning(f"Semantic Cache read error: {e}")
+
+    # 2. Build prompt and call LLM on cache miss
+    known_name = state.get_user_name(user_number)
+    name_line = (
+        f'The user\'s name is {known_name}. Address them by that name '
+        f'naturally where it fits, but not in every single message. '
+        f'Never address the user as "{BOT_NAME}", that is YOUR name, not theirs.'
+        if known_name else
+        'Do not invent or guess a name for the user; just don\'t use a '
+        'name at all until they give you one.'
+    )
     prompt = UNDERSTAND_PROMPT.format(
         bot=BOT_NAME, biz=BUSINESS_NAME, knowledge=FYNLO_KNOWLEDGE,
-        history=history, message=message,
+        history=history, message=message, name_line=name_line,
     )
+    
     raw = ask_llm(prompt)
-    return _parse_understand_response(raw)
+    parsed_result = _parse_understand_response(raw)
+
+    # 3. Store valid non-escalated responses in Upstash Semantic Cache
+    if cache:
+        try:
+            if parsed_result.get("intent") in ("answer", "book", "manage_booking", "out_of_domain"):
+                cache.set(message, raw)
+        except Exception as e:
+            logger.warning(f"Semantic Cache write error: {e}")
+
+    return parsed_result
 
 
 def _parse_understand_response(raw: str) -> dict:
     """
-    Parses the model's JSON reply, tolerating the common ways a text
-    completion can drift from strict JSON (markdown fences, chatter before/
-    after the object, an unescaped quote/newline inside "reply"). Only
-    falls back to a generic decline if genuinely nothing usable can be
-    salvaged — this avoids a harmless message like "can you sing" turning
-    into a false "bot error" escalation to the owner over a formatting slip.
+    Parses the model's JSON reply, tolerating markdown fences and unescaped quotes.
     """
     cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
 
@@ -159,8 +239,6 @@ def _parse_understand_response(raw: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Fallback 1: the model likely added stray text around the JSON object —
-    # grab the outermost {...} and retry.
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
@@ -170,9 +248,6 @@ def _parse_understand_response(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Fallback 2: pull out "intent" and "reply" with regex directly — handles
-    # cases where an unescaped quote/newline inside "reply" broke strict
-    # JSON parsing but the fields are still clearly there.
     intent_match = re.search(r'"intent"\s*:\s*"(\w+)"', cleaned)
     reply_match = re.search(r'"reply"\s*:\s*"(.*?)"\s*(?:,\s*"|\}\s*$)', cleaned, re.DOTALL)
     intent = intent_match.group(1) if intent_match else None
@@ -180,9 +255,6 @@ def _parse_understand_response(raw: str) -> dict:
         reply_text = reply_match.group(1) if reply_match else ""
         return {"intent": intent, "reply": reply_text}
 
-    # Fallback 3: genuinely nothing usable — treat as an out-of-domain chat
-    # message rather than throwing, so the user gets a normal reply instead
-    # of the "I hit a snag" error and a false alarm to the owner.
     logger.warning(f"Could not parse LLM understand-response, falling back: {raw[:300]!r}")
     return {
         "intent": "out_of_domain",
@@ -206,9 +278,6 @@ Summary:"""
 
 
 def _summarize_for_escalation(history: str) -> str | None:
-    """Best-effort LLM summary for the escalation alert. Returns None on any
-    failure so the caller can fall back to a raw trimmed transcript instead
-    of losing the escalation entirely over a summarization hiccup."""
     try:
         summary = ask_llm(_ESCALATION_SUMMARY_PROMPT.format(history=history)).strip()
         return summary if summary else None
@@ -218,19 +287,6 @@ def _summarize_for_escalation(history: str) -> str | None:
 
 
 def escalate_to_owner(user_number: str, reason: str) -> bool:
-    """
-    Sends the founder a WhatsApp alert with context. Returns True if it
-    actually sent.
-
-    IMPORTANT: WhatsApp only allows FREEFORM business messages within a 24h
-    window after the recipient last messaged you — outside that window,
-    Twilio rejects the send with error 63016. Since the owner may not have
-    texted the bot recently, freeform escalation alerts can silently fail.
-    If TWILIO_ESCALATION_TEMPLATE_SID is set (an approved WhatsApp Message
-    Template's Content SID), that's used instead — templates can be sent
-    anytime, regardless of the 24h window, which is what business-initiated
-    alerts like this actually need.
-    """
     if not OWNER_WHATSAPP_NUMBER:
         logger.error("OWNER_WHATSAPP_NUMBER not set — can't escalate")
         return False
@@ -238,28 +294,20 @@ def escalate_to_owner(user_number: str, reason: str) -> bool:
         reason = reason if len(reason) <= 300 else reason[:300] + "…"
         header = f"🚨 *Fynlo Escalation*\n\n*From:* {user_number}\n*Why:* {reason}\n\n*Summary:*\n"
         footer = "\n\nReply directly on WhatsApp to help them."
-        budget = _TWILIO_BODY_LIMIT - len(header) - len(footer) - 20  # small safety margin
+        budget = _TWILIO_BODY_LIMIT - len(header) - len(footer) - 20
 
         history = state.get_history_text(user_number)
         body_middle = _summarize_for_escalation(history)
 
         if body_middle is None:
-            # Fallback: raw history, trimmed from the OLDEST end first if it
-            # doesn't fit, rather than cutting off wherever it lands.
             body_middle = history
             header = header.replace("*Summary:*", "*Conversation:*")
             if len(body_middle) > budget:
                 body_middle = "...(earlier messages trimmed)...\n" + body_middle[-(budget - 40):]
         elif len(body_middle) > budget:
-            # Summary itself somehow ran long — hard cap as a last resort.
             body_middle = body_middle[:budget - 1] + "…"
 
         if TWILIO_ESCALATION_TEMPLATE_SID:
-            # Approved template path — works outside the 24h window. The
-            # template must be pre-approved with matching variable slots
-            # (e.g. {{1}}=from, {{2}}=why, {{3}}=summary) in Twilio's
-            # Content Template Builder; adjust the variable keys below to
-            # match however your specific template was defined.
             twilio_client.messages.create(
                 from_=TWILIO_WHATSAPP_FROM,
                 to=OWNER_WHATSAPP_NUMBER,
@@ -267,12 +315,10 @@ def escalate_to_owner(user_number: str, reason: str) -> bool:
                 content_variables=json.dumps({
                     "1": user_number,
                     "2": reason,
-                    "3": body_middle[:1000],  # templates have their own (often tighter) limits
+                    "3": body_middle[:1000],
                 }),
             )
         else:
-            # Freeform fallback — only actually delivers if the owner has
-            # messaged the bot within the last 24h (error 63016 otherwise).
             twilio_client.messages.create(
                 from_=TWILIO_WHATSAPP_FROM,
                 to=OWNER_WHATSAPP_NUMBER,
@@ -285,10 +331,7 @@ def escalate_to_owner(user_number: str, reason: str) -> bool:
 
 
 # ── Core routing ──────────────────────────────────────────
-# Transient, self-resolving (retry later, no owner action needed):
 _RATE_LIMIT_HINT_RE = re.compile(r"rate.?limit|429|tokens per day|tpd", re.IGNORECASE)
-# Permanent until the owner adds billing/upgrades a plan — waiting doesn't
-# fix this, so it needs a different message AND an owner heads-up:
 _QUOTA_EXHAUSTED_HINT_RE = re.compile(
     r"free.?tier|free.?quota|allocationquota|payment.?information|"
     r"insufficient.?quota|billing", re.IGNORECASE,
@@ -302,30 +345,20 @@ def handle_message(message: str, user_number: str) -> str:
     except Exception as e:
         err_str = str(e)
         if _QUOTA_EXHAUSTED_HINT_RE.search(err_str):
-            # Provider's free tier is exhausted / billing needed — this is
-            # PERMANENT until someone adds payment info, not something that
-            # resolves by waiting. Tell the user something honest (not "try
-            # again shortly", which would be false), and make sure the owner
-            # actually knows to go fix billing, since the bot is fully down
-            # until they do.
             logger.error(f"LLM provider quota/billing exhausted for {user_number}: {e}")
             escalate_to_owner(user_number, f"LLM provider quota/billing exhausted — bot is down: {err_str[:200]}")
             reply = (
-                "Sorry, I'm temporarily unable to answer questions — I've flagged this to our "
+                "Sorry, I'm temporarily unable to answer questions, I've flagged this to our "
                 f"team. For anything urgent, please contact us directly here: {BOOKING_LINK}"
             )
         elif _RATE_LIMIT_HINT_RE.search(err_str):
-            # Provider-side rate-limit — expected & self-resolving, not a
-            # real bug. Log it (so YOU notice quota is tight) but don't page
-            # the owner over it every time, and give the user an honest,
-            # less alarming message than "I hit a snag."
             logger.warning(f"LLM rate-limited for {user_number}: {e}")
-            reply = "Sorry, I'm getting a lot of messages right now — mind trying again in a couple of minutes?"
+            reply = "Sorry, I'm getting a lot of messages right now, mind trying again in a couple of minutes?"
         else:
             logger.error(f"Error handling message from {user_number}: {e}", exc_info=True)
             escalate_to_owner(user_number, f"Bot error: {e}")
             reply = (
-                "Sorry, I hit a snag answering that. I've flagged it to our team — "
+                "Sorry, I hit a snag answering that. I've flagged it to our team, "
                 f"for anything urgent, reach us directly here: {BOOKING_LINK}"
             )
     state.add_turn(user_number, "bot", reply)
@@ -348,59 +381,30 @@ _STOP_BOOKING_RE = re.compile(
 )
 
 _STEP_RESUME_HINT = {
-    "name": "Anyway — what's your name?",
-    "email": "Anyway — what email should the invite go to?",
-    "query": "Anyway — what would you like the call to be about?",
-    "time": "Anyway — what day/time works for you?",
+    "name": "Anyway, what's your name?",
+    "email": "Anyway, what email should the invite go to?",
+    "query": "Anyway, what would you like the call to be about?",
+    "time": "Anyway, what day/time works for you?",
 }
 
 
 def _looks_like_digression(message: str) -> bool:
-    """
-    Mid-booking, most steps (name/email/query) accept nearly any free text,
-    so we only want to bail out to the reasoning LLM when the message looks
-    like a genuine question/new topic rather than an attempted answer.
-    "time" is the step where this matters most in practice (e.g. "do you
-    sell apples" landing on a date parser instead of being answered), but
-    any step can get derailed by a real question, so this check applies
-    uniformly before we hand the message to the step-specific parser.
-    """
     return bool(_QUESTION_HINT_RE.search(message.strip()))
 
 
 def _maybe_inline_time(message: str):
-    """
-    Cheap pre-check before attempting to parse a time out of a message that
-    triggered book/reschedule (e.g. "reschedule to friday after 2" already
-    contains the new time — no reason to throw that away and ask again).
-    Only bothers calling parse_preferred_time (which can fall back to an
-    LLM call) if the message actually looks like it contains a time.
-    """
     if not _TIME_HINT_RE.search(message):
         return None
     return parse_preferred_time(message)
 
 
 def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | None = None) -> str:
-    """
-    Starts a booking (fresh or reschedule), pre-filling name/email if we
-    already have them from the customer's last successful booking — so a
-    returning user doesn't get asked "what's your name/email" every single
-    time, which is the whole point of remembering it in the first place.
-
-    Fresh bookings (not reschedules) always ask "what's this about" FIRST,
-    before any personal details — that way the query step (below, in
-    _route) gets a chance to just answer the question directly instead of
-    marching the user through name/email/time for something that didn't
-    need a call at all. Reschedules skip the query step entirely (there's
-    already a booking on file, nothing to "answer" instead of).
-    """
     state.start_booking(user_number)
     booking = state.get_booking(user_number)
 
     last_name, last_email = state.get_last_customer(user_number)
     if not last_email:
-        last_email = state.find_known_email(user_number)  # fallback: scan this conversation's history
+        last_email = state.find_known_email(user_number)
 
     if rescheduling_id:
         booking["_rescheduling_id"] = rescheduling_id
@@ -415,12 +419,12 @@ def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | N
                     state.set_last_customer(user_number, last_name, last_email)
                     state.clear_booking(user_number)
                 else:
-                    booking["step"] = "time"  # slot busy / needs another attempt
+                    booking["step"] = "time"
                 return reply
 
             booking["step"] = "time"
             return (
-                f"Using your last details — {last_name}, {last_email} "
+                f"Using your last details, {last_name}, {last_email}, "
                 f"(tell me if either's wrong). {ask_for_time()}"
             )
 
@@ -428,9 +432,8 @@ def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | N
             booking["email"] = last_email
             booking["_known_email"] = True
         booking["step"] = "name"
-        return "Sure — what name should the new booking be under?"
+        return "Sure, what name should the new booking be under?"
 
-    # ── Fresh booking: always ask what it's about first ──────
     if last_name:
         booking["name"] = last_name
     if last_email:
@@ -442,41 +445,25 @@ def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | N
 def _route(message: str, user_number: str) -> str:
     booking = state.get_booking(user_number)
 
-    # ── Mid-booking-flow: collect fields step by step ────────
     if booking:
         step = booking["step"]
 
-        # Explicit "stop/cancel this booking" always wins, cheaply, no LLM
-        # call needed — e.g. "don't book a call", "never mind", "stop".
         if _STOP_BOOKING_RE.search(message):
             state.clear_booking(user_number)
-            return "No worries, I've dropped that — anything else I can help with?"
+            return "No worries, I've dropped that, anything else I can help with?"
 
-        # Bail out to the reasoning LLM if this doesn't look like an answer
-        # to the current step but a genuine question/new topic (e.g. "do
-        # you sell apples" while we're waiting on a time). We still want to
-        # resume the booking afterward, so only divert for intents that are
-        # actually answerable/off-topic — "book"/"manage_booking" fall
-        # through to normal step-processing since those are ambiguous
-        # enough that treating the raw text as the step answer is still the
-        # safer bet. "escalate" also breaks out, since something like a
-        # refund complaint surfacing mid-flow shouldn't keep marching
-        # toward name/email/time.
         if step != "query" and _looks_like_digression(message):
-            result = _understand_and_respond(message, state.get_history_text(user_number))
+            result = _understand_and_respond(message, state.get_history_text(user_number), user_number)
             if result["intent"] in ("answer", "out_of_domain"):
                 resume = _STEP_RESUME_HINT.get(step, "")
                 return f"{result['reply']}\n\n{resume}".strip()
             if result["intent"] == "escalate":
-                # Keep the booking alive — the user was already partway
-                # through booking a call, no reason to drop that just
-                # because something escalate-worthy came up along the way.
                 sent = escalate_to_owner(user_number, result.get("reply") or message)
                 resume = _STEP_RESUME_HINT.get(step, "")
                 flag_note = (
                     "I've flagged this to our team so they can look into it properly. "
                     if sent else
-                    f"I'm having trouble reaching our team's alert system right now — for "
+                    f"I'm having trouble reaching our team's alert system right now, for "
                     f"anything urgent, contact us directly here: {BOOKING_LINK}. "
                 )
                 return f"{flag_note}{resume}".strip()
@@ -484,26 +471,17 @@ def _route(message: str, user_number: str) -> str:
         if step == "query":
             state.update_booking(user_number, "query", message.strip())
 
-            # Give the reasoning LLM a shot at just answering this before
-            # committing to the full name/email/time booking flow — no
-            # reason to book a call for something answerable from the
-            # knowledge base.
-            result = _understand_and_respond(message, state.get_history_text(user_number))
+            result = _understand_and_respond(message, state.get_history_text(user_number), user_number)
             if result["intent"] in ("answer", "out_of_domain"):
                 state.clear_booking(user_number)
                 return f"{result['reply']}\n\nWant me to set up a call for this too, or does that cover it?"
 
             if result["intent"] == "escalate":
-                # The user's ORIGINAL intent here was to book a call — a
-                # complex/escalate-worthy query doesn't change that. Flag it
-                # to the owner (with the current conversation state) AND
-                # keep moving toward getting the call actually booked,
-                # instead of dropping the booking flow entirely.
                 sent = escalate_to_owner(user_number, result.get("reply") or message)
                 flag_note = (
                     "I've flagged this to our team so they can look into it properly. "
                     if sent else
-                    f"I'm having trouble reaching our team's alert system right now — for "
+                    f"I'm having trouble reaching our team's alert system right now, for "
                     f"anything urgent, contact us directly here: {BOOKING_LINK}. "
                 )
 
@@ -538,7 +516,7 @@ def _route(message: str, user_number: str) -> str:
 
         if step == "email":
             if not is_valid_email(message.strip()):
-                return "That doesn't quite look like a valid email — mind double-checking it?"
+                return "That doesn't quite look like a valid email, mind double-checking it?"
             state.update_booking(user_number, "email", message.strip())
             booking["step"] = "time"
             return ask_for_time()
@@ -551,7 +529,6 @@ def _route(message: str, user_number: str) -> str:
                     state.set_last_booking_id(user_number, new_id)
                     state.set_last_customer(user_number, booking["name"], booking["email"])
                     state.clear_booking(user_number)
-                # else: stay on "time" step, next message tried again
                 return reply
 
             reply, booking_id = attempt_booking(
@@ -562,21 +539,20 @@ def _route(message: str, user_number: str) -> str:
                 state.set_last_booking_id(user_number, booking_id)
                 state.set_last_customer(user_number, booking["name"], booking["email"])
                 state.clear_booking(user_number)
-            # else: stay on "time" step, next message tried again
             return reply
 
-    # ── Pure greeting: instant, no LLM call — but ONLY if this is truly
-    # the first message. Mid-conversation, a bare "yo"/"hey" is often
-    # shorthand for "yeah" answering whatever the bot just asked, not a
-    # fresh hello, so it needs the full-context LLM below instead.
     if state.is_first_message(user_number) and _GREETING_RE.match(message):
-        return (
-            f"Hey there! 👋 I'm {BOT_NAME}, from {BUSINESS_NAME}. I can answer questions "
-            f"about pricing, features, integrations, or help you book a call. What can I help with?"
-        )
+        state.set_awaiting_name(user_number, True)
+        return "Hi! What's up, how can I help you today? Oh, and what should I call you?"
 
-    # ── Fresh message: one LLM call decides everything ───────
-    result = _understand_and_respond(message, state.get_history_text(user_number))
+    if state.is_awaiting_name(user_number) and not state.get_user_name(user_number):
+        state.set_awaiting_name(user_number, False)
+        name = _extract_name(message)
+        if name:
+            state.set_user_name(user_number, name)
+            return f"Nice to meet you, {name}! What can I help you with today?"
+
+    result = _understand_and_respond(message, state.get_history_text(user_number), user_number)
     intent = result["intent"]
     logger.info(f"Intent: {intent}")
 
@@ -590,7 +566,7 @@ def _route(message: str, user_number: str) -> str:
         booking_id = state.get_last_booking_id(user_number)
         if not booking_id:
             escalate_to_owner(user_number, "Wants to cancel/reschedule but no booking on file")
-            return "I don't have a booking on file for this number — I've flagged this to our team to sort out with you directly."
+            return "I don't have a booking on file for this number, I've flagged this to our team to sort out with you directly."
 
         if _CANCEL_RE.search(message):
             reply = cancel_flow(booking_id)
@@ -599,19 +575,14 @@ def _route(message: str, user_number: str) -> str:
 
         return _start_booking_flow(user_number, message, rescheduling_id=booking_id)
 
-    # intent == "escalate" — genuinely complex stuff (bugs, refunds, custom
-    # enterprise terms, etc). Notify the owner with the full conversation,
-    # let the user know the team will follow up, AND offer a call as a
-    # faster path — if they take it, their next message naturally becomes
-    # "book" per the prompt rules above.
     sent = escalate_to_owner(user_number, result.get("reply") or message)
     if sent:
         return (
-            "Thanks for reaching out! This needs a closer look — I've flagged it to our "
+            "Thanks for reaching out! This needs a closer look, I've flagged it to our "
             "team and someone will get back to you shortly. 🙏 If you'd rather not wait, "
-            "I can also get a call on the calendar for you now — just say the word."
+            "I can also get a call on the calendar for you now, just say the word."
         )
-    return f"Thanks for reaching out! I'm having trouble reaching our team's alert system right now — for anything urgent, please contact us directly here: {BOOKING_LINK}"
+    return f"Thanks for reaching out! I'm having trouble reaching our team's alert system right now, for anything urgent, please contact us directly here: {BOOKING_LINK}"
 
 
 # ── Twilio webhook ────────────────────────────────────────
@@ -621,6 +592,21 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
     twiml = MessagingResponse()
     twiml.message(reply_text)
     return PlainTextResponse(content=str(twiml), media_type="application/xml")
+
+
+# ── Website chat widget endpoint ──────────────────────────
+@app.post("/chat")
+async def chat(request: Request):
+    data = await request.json()
+    message = (data.get("message") or "").strip()
+    session_id = data.get("session_id") or "anonymous"
+
+    if not message:
+        return {"reply": "Say something and I'll take a look!"}
+
+    user_key = f"web:{session_id}"
+    reply = handle_message(message, user_key)
+    return {"reply": reply}
 
 
 # ── Test endpoint (bypass Twilio) ─────────────────────────

@@ -35,7 +35,7 @@ LLM_PRIORITY = [
     p.strip().lower()
     for p in os.getenv(
         "LLM_PRIORITY",
-        "gemini,groq,openai,qwen"
+        "gemini,groq,openai,qwen,mistral"
     ).split(",")
 ]
 
@@ -58,6 +58,10 @@ QWEN_API_BASE = os.getenv(
     "QWEN_API_BASE",
     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 )
+
+# Mistral
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 
 # ── TidyCal (real booking) ────────────────────────────────
 TIDYCAL_API_KEY         = os.getenv("TIDYCAL_API_KEY", "")
