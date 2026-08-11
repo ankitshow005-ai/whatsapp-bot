@@ -22,6 +22,7 @@
 
 import logging
 import re
+import zoneinfo
 from datetime import datetime, timedelta
 
 from tidycal_api import (
@@ -38,6 +39,7 @@ from config import TIDYCAL_TIMEZONE, BOOKING_LINK
 logger = logging.getLogger(__name__)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_LOCAL_TZ = zoneinfo.ZoneInfo(TIDYCAL_TIMEZONE)
 
 
 # ── Step prompts ────────────────────────────────────────────
@@ -87,7 +89,7 @@ def attempt_booking(name: str, email: str, query: str, time_text: str) -> tuple[
     try:
         if is_slot_available(requested_time):
             booking = create_booking(name=name, email=email, start_time=requested_time, notes=query)
-            when = requested_time.strftime("%A, %d %b at %I:%M %p")
+            when = requested_time.astimezone(_LOCAL_TZ).strftime("%A, %d %b at %I:%M %p")
             return (
                 f"You're booked, {name}! 🎉\n\n"
                 f"*When:* {when} ({TIDYCAL_TIMEZONE})\n"
@@ -119,13 +121,24 @@ def _suggest_alternatives(requested_time: datetime) -> str:
     try:
         same_day_slots = get_available_slots(day_start, day_start + timedelta(days=1))
         if same_day_slots:
-            times = ", ".join(s.strftime("%I:%M %p") for s in same_day_slots[:5])
+            # IMPORTANT: TidyCal returns slot times in UTC. Displaying them
+            # with strftime() directly (without converting to the local
+            # TIDYCAL_TIMEZONE first) shows the WRONG wall-clock time to the
+            # user — e.g. a UTC 08:00 slot is actually 1:30 PM in
+            # Asia/Kolkata, not 8:00 AM. That mismatch caused an infinite
+            # "not free" loop: the user would reply with the literal time
+            # shown (which matched nothing in local time), and this loop
+            # would immediately show the same UTC-labelled list again.
+            # Always convert to local tz here before formatting.
+            local_slots = [s.astimezone(_LOCAL_TZ) for s in same_day_slots]
+            times = ", ".join(s.strftime("%I:%M %p") for s in local_slots[:5])
             return f"Here's what's free that day instead: {times}. Any of these work?"
 
         window_slots = get_available_slots(day_start, day_start + timedelta(days=3))
         if window_slots:
+            local_window_slots = [s.astimezone(_LOCAL_TZ) for s in window_slots]
             by_day: dict[str, list[str]] = {}
-            for s in window_slots:
+            for s in local_window_slots:
                 by_day.setdefault(s.strftime("%A, %d %b"), []).append(s.strftime("%I:%M %p"))
             lines = [f"*{day}:* {', '.join(times[:4])}" for day, times in by_day.items()]
             return (
@@ -171,7 +184,7 @@ def reschedule_flow(booking_id: str, name: str, email: str, time_text: str) -> t
     try:
         if is_slot_available(new_time):
             booking = reschedule_booking(int(booking_id), name=name, email=email, new_start_time=new_time)
-            when = new_time.strftime("%A, %d %b at %I:%M %p")
+            when = new_time.astimezone(_LOCAL_TZ).strftime("%A, %d %b at %I:%M %p")
             new_id = str(booking.get("id")) if booking.get("id") is not None else booking_id
             return (
                 f"Rescheduled! ✅\n\n*New time:* {when} ({TIDYCAL_TIMEZONE})\n"
