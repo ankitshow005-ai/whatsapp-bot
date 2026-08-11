@@ -52,7 +52,12 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 # directly from the browser. Lock ALLOWED_ORIGINS down to your real domain(s)
 # in .env for production — "*" is fine only for local dev.
 _origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
-ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()]
+ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _origins_env.split(",") if o.strip()]
+
+# Loud and unmissable at startup — if this doesn't show your actual
+# deployed frontend domain, THAT is the bug. Check your host's dashboard
+# (Render/Railway → Environment Variables → ALLOWED_ORIGINS) and redeploy.
+logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -593,18 +598,6 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
     twiml.message(reply_text)
     return PlainTextResponse(content=str(twiml), media_type="application/xml")
 
-# ── Global Preflight Handler for Render Proxy ───────────
-@app.options("/{full_path:path}")
-async def options_handler(request: Request, full_path: str):
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
-            "Access-Control-Allow-Methods": "POST, GET, OPTIONS, PUT, DELETE",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Credentials": "true",
-        },
-    )
 
 # ── Website chat widget endpoint ──────────────────────────
 @app.post("/chat")
