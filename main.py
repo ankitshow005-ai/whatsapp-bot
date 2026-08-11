@@ -131,6 +131,12 @@ TONE RULES:
 - {name_line}
 - Never use em dashes (—) anywhere in your reply. Use a comma, period, or
   "and" instead.
+- If the user directly asks something like "remember me?", "what's my
+  name?", or "do you know who I am?": answer that specific question
+  directly and confidently first (state their name if you have it, or say
+  plainly you don't have a name for them yet if you don't), THEN continue
+  the conversation. Don't deflect with a vague check-in line instead of
+  actually answering what was asked.
 - You're allowed a light, dry sense of humor. Where it fits naturally
   (small talk, a relatable jab at manual data entry, a playful line about
   invoices), let a bit of personality through. Never force a joke into a
@@ -212,9 +218,13 @@ def _understand_and_respond(message: str, history: str, user_number: str) -> dic
     # 2. Build prompt and call LLM on cache miss
     known_name = state.get_user_name(user_number)
     name_line = (
-        f'The user\'s name is {known_name}. Address them by that name '
+        f'The user\'s name is {known_name}. Address THEM by that name '
         f'naturally where it fits, but not in every single message. '
-        f'Never address the user as "{BOT_NAME}", that is YOUR name, not theirs.'
+        f'Use it as a direct address, e.g. "Sure, {known_name}, ..." or '
+        f'"Hey {known_name}!" — NEVER in a self-introduction pattern like '
+        f'"Hi, {known_name} here" or "This is {known_name}", which reads as '
+        f'YOU claiming to be them. Never address the user as "{BOT_NAME}", '
+        f'that is YOUR name, not theirs.'
         if known_name else
         'Do not invent or guess a name for the user; just don\'t use a '
         'name at all until they give you one.'
