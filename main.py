@@ -88,6 +88,7 @@ else:
 _GREETING_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo|sup|good\s*(morning|afternoon|evening)|namaste|hola)\s*[!.?]*\s*$", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"\b(cancel|scrap|drop)\b", re.IGNORECASE)
 _NAME_LEADIN_RE = re.compile(r"^\s*(?:i'?m|i am|it'?s|its|this is|my name'?s|my name is|name'?s|name is|call me)\s+", re.IGNORECASE)
+_NAME_TRAILING_RE = re.compile(r"\s+(?:here|speaking)\s*$", re.IGNORECASE)
 
 
 def _extract_name(message: str) -> str | None:
@@ -103,6 +104,7 @@ def _extract_name(message: str) -> str | None:
     if not text or "?" in text or len(text) > 30:
         return None
     stripped = _NAME_LEADIN_RE.sub("", text).strip()
+    stripped = _NAME_TRAILING_RE.sub("", stripped).strip()
     if not stripped:
         return None
     words = stripped.split()
