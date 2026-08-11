@@ -95,6 +95,21 @@ def update_booking(user_number: str, field: str, value: str) -> None:
         entry["booking"][field] = value
         _save(user_number, entry)
 
+def save_booking(user_number: str, booking: dict) -> None:
+    """
+    Persists the FULL booking dict back to Redis in one write. Needed
+    because get_booking() returns a fresh copy deserialized from Redis on
+    every call — mutating fields on that dict directly (e.g.
+    booking["step"] = "email") only changes the in-memory local object and
+    is silently lost otherwise. Callers that mutate booking dict fields
+    directly (step, name, email, query, _rescheduling_id, etc.) must call
+    this before returning, or the next message will re-load the old state
+    from Redis and the flow will appear stuck / repeat itself.
+    """
+    entry = _get(user_number)
+    entry["booking"] = booking
+    _save(user_number, entry)
+
 def clear_booking(user_number: str) -> None:
     entry = _get(user_number)
     entry["booking"] = None

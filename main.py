@@ -521,9 +521,11 @@ def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | N
                     state.clear_booking(user_number)
                 else:
                     booking["step"] = "time"
+                    state.save_booking(user_number, booking)
                 return reply
 
             booking["step"] = "time"
+            state.save_booking(user_number, booking)
             return (
                 f"Using your last details, {last_name}, {last_email}, "
                 f"(tell me if either's wrong). {ask_for_time()}"
@@ -533,6 +535,7 @@ def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | N
             booking["email"] = last_email
             booking["_known_email"] = True
         booking["step"] = "name"
+        state.save_booking(user_number, booking)
         return "Sure, what name should the new booking be under?"
 
     if last_name:
@@ -540,6 +543,7 @@ def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | N
     if last_email:
         booking["email"] = last_email
     booking["step"] = "query"
+    state.save_booking(user_number, booking)
     return ask_for_query()
 
 
@@ -570,7 +574,7 @@ def _route(message: str, user_number: str) -> str:
                 return f"{flag_note}{resume}".strip()
 
         if step == "query":
-            state.update_booking(user_number, "query", message.strip())
+            booking["query"] = message.strip()
 
             result = _understand_and_respond(message, state.get_history_text(user_number), user_number)
             if result["intent"] in ("answer", "out_of_domain"):
@@ -588,38 +592,47 @@ def _route(message: str, user_number: str) -> str:
 
                 if booking.get("name") and booking.get("email"):
                     booking["step"] = "time"
+                    state.save_booking(user_number, booking)
                     return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_time()
                 if booking.get("name"):
                     booking["step"] = "email"
+                    state.save_booking(user_number, booking)
                     return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_email()
                 booking["step"] = "name"
+                state.save_booking(user_number, booking)
                 return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_name()
 
             if booking.get("name") and booking.get("email"):
                 booking["step"] = "time"
+                state.save_booking(user_number, booking)
                 return ask_for_time()
             if booking.get("name"):
                 booking["step"] = "email"
+                state.save_booking(user_number, booking)
                 return ask_for_email()
             booking["step"] = "name"
+            state.save_booking(user_number, booking)
             return ask_for_name()
 
         if step == "name":
-            state.update_booking(user_number, "name", message.strip())
+            booking["name"] = message.strip()
             if booking.get("email"):
                 booking["step"] = "time"
+                state.save_booking(user_number, booking)
                 return (
                     f"Thanks! I'll use {booking['email']} for the invite "
                     f"(let me know if that's wrong). {ask_for_time()}"
                 )
             booking["step"] = "email"
+            state.save_booking(user_number, booking)
             return ask_for_email()
 
         if step == "email":
             if not is_valid_email(message.strip()):
                 return "That doesn't quite look like a valid email, mind double-checking it?"
-            state.update_booking(user_number, "email", message.strip())
+            booking["email"] = message.strip()
             booking["step"] = "time"
+            state.save_booking(user_number, booking)
             return ask_for_time()
 
         if step == "time":
