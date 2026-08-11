@@ -131,6 +131,13 @@ TONE RULES:
 - {name_line}
 - Never use em dashes (—) anywhere in your reply. Use a comma, period, or
   "and" instead.
+- You're allowed a light, dry sense of humor. Where it fits naturally
+  (small talk, a relatable jab at manual data entry, a playful line about
+  invoices), let a bit of personality through. Never force a joke into a
+  serious question (pricing, refunds, technical issues), and never let
+  humor get in the way of actually answering clearly. Confident and a
+  little witty beats stiff and corporate, but the answer always comes
+  first.
 
 KNOWLEDGE BASE (use this to answer questions, including sales/"should I buy"
 questions — be a helpful, confident sales rep using the SALES GUIDANCE and
@@ -291,48 +298,85 @@ def _summarize_for_escalation(history: str) -> str | None:
         return None
 
 
-def escalate_to_owner(user_number: str, reason: str) -> bool:
-    if not OWNER_WHATSAPP_NUMBER:
-        logger.error("OWNER_WHATSAPP_NUMBER not set — can't escalate")
+import requests
+
+# ── Telegram escalation (free, no Twilio/WhatsApp API needed) ────────────
+# Setup (5 min):
+#   1. Message @BotFather on Telegram, send /newbot, follow prompts.
+#      It gives you a token like "123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+#   2. Message your new bot anything (e.g. "hi") so it can see your chat.
+#   3. Visit https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates in a browser
+#      -> find "chat":{"id": 123456789, ...} -> that's your chat id.
+#   4. Set these two env vars on Render:
+#        TELEGRAM_BOT_TOKEN=123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#        TELEGRAM_CHAT_ID=123456789
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def notify_owner_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     try:
-        reason = reason if len(reason) <= 300 else reason[:300] + "…"
-        header = f"🚨 *Fynlo Escalation*\n\n*From:* {user_number}\n*Why:* {reason}\n\n*Summary:*\n"
-        footer = "\n\nReply directly on WhatsApp to help them."
-        budget = _TWILIO_BODY_LIMIT - len(header) - len(footer) - 20
-
-        history = state.get_history_text(user_number)
-        body_middle = _summarize_for_escalation(history)
-
-        if body_middle is None:
-            body_middle = history
-            header = header.replace("*Summary:*", "*Conversation:*")
-            if len(body_middle) > budget:
-                body_middle = "...(earlier messages trimmed)...\n" + body_middle[-(budget - 40):]
-        elif len(body_middle) > budget:
-            body_middle = body_middle[:budget - 1] + "…"
-
-        if TWILIO_ESCALATION_TEMPLATE_SID:
-            twilio_client.messages.create(
-                from_=TWILIO_WHATSAPP_FROM,
-                to=OWNER_WHATSAPP_NUMBER,
-                content_sid=TWILIO_ESCALATION_TEMPLATE_SID,
-                content_variables=json.dumps({
-                    "1": user_number,
-                    "2": reason,
-                    "3": body_middle[:1000],
-                }),
-            )
-        else:
-            twilio_client.messages.create(
-                from_=TWILIO_WHATSAPP_FROM,
-                to=OWNER_WHATSAPP_NUMBER,
-                body=header + body_middle + footer,
-            )
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        resp.raise_for_status()
         return True
     except Exception as e:
-        logger.error(f"Escalation send failed: {e}")
+        logger.error(f"Telegram escalation send failed: {e}")
         return False
+
+
+def escalate_to_owner(user_number: str, reason: str) -> bool:
+    reason = reason if len(reason) <= 300 else reason[:300] + "…"
+    history = state.get_history_text(user_number)
+    body_middle = _summarize_for_escalation(history)
+    if body_middle is None:
+        body_middle = history
+
+    telegram_sent = notify_owner_telegram(
+        f"🚨 *Fynlo Escalation*\n\n*From:* {user_number}\n*Why:* {reason}\n\n"
+        f"*Summary:*\n{body_middle[:3500]}"
+    )
+
+    whatsapp_sent = False
+    if OWNER_WHATSAPP_NUMBER:
+        try:
+            header = f"🚨 *Fynlo Escalation*\n\n*From:* {user_number}\n*Why:* {reason}\n\n*Summary:*\n"
+            footer = "\n\nReply directly on WhatsApp to help them."
+            budget = _TWILIO_BODY_LIMIT - len(header) - len(footer) - 20
+            wa_body_middle = body_middle
+            if len(wa_body_middle) > budget:
+                wa_body_middle = wa_body_middle[:budget - 1] + "…"
+
+            if TWILIO_ESCALATION_TEMPLATE_SID:
+                twilio_client.messages.create(
+                    from_=TWILIO_WHATSAPP_FROM,
+                    to=OWNER_WHATSAPP_NUMBER,
+                    content_sid=TWILIO_ESCALATION_TEMPLATE_SID,
+                    content_variables=json.dumps({
+                        "1": user_number,
+                        "2": reason,
+                        "3": wa_body_middle[:1000],
+                    }),
+                )
+            else:
+                twilio_client.messages.create(
+                    from_=TWILIO_WHATSAPP_FROM,
+                    to=OWNER_WHATSAPP_NUMBER,
+                    body=header + wa_body_middle + footer,
+                )
+            whatsapp_sent = True
+        except Exception as e:
+            logger.error(f"WhatsApp escalation send failed: {e}")
+
+    if not telegram_sent and not whatsapp_sent:
+        logger.error("Escalation failed on all channels (Telegram + WhatsApp)")
+
+    return telegram_sent or whatsapp_sent
 
 
 # ── Core routing ──────────────────────────────────────────
@@ -341,6 +385,20 @@ _QUOTA_EXHAUSTED_HINT_RE = re.compile(
     r"free.?tier|free.?quota|allocationquota|payment.?information|"
     r"insufficient.?quota|billing", re.IGNORECASE,
 )
+
+
+_EM_DASH_RE = re.compile(r"\s*—\s*")
+
+
+def _sanitize_reply(text: str) -> str:
+    """
+    Belt-and-suspenders for the 'never use em dashes' prompt rule — LLMs
+    don't always follow style instructions 100% of the time, so this
+    guarantees it regardless of what the model actually outputs. Replaces
+    with a period + space, which reads naturally in most cases an em dash
+    would've been used (a clause break).
+    """
+    return _EM_DASH_RE.sub(". ", text)
 
 
 def handle_message(message: str, user_number: str) -> str:
@@ -366,6 +424,7 @@ def handle_message(message: str, user_number: str) -> str:
                 "Sorry, I hit a snag answering that. I've flagged it to our team, "
                 f"for anything urgent, reach us directly here: {BOOKING_LINK}"
             )
+    reply = _sanitize_reply(reply)
     state.add_turn(user_number, "bot", reply)
     return reply
 
