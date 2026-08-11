@@ -89,6 +89,7 @@ _GREETING_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo|sup|good\s*(morning|afternoo
 _CANCEL_RE = re.compile(r"\b(cancel|scrap|drop)\b", re.IGNORECASE)
 _NAME_LEADIN_RE = re.compile(r"^\s*(?:i'?m|i am|it'?s|its|this is|my name'?s|my name is|name'?s|name is|call me)\s+", re.IGNORECASE)
 _NAME_TRAILING_RE = re.compile(r"\s+(?:here|speaking)\s*$", re.IGNORECASE)
+_NAME_TRAILING_RE = re.compile(r"\s+(?:here|speaking)\s*$", re.IGNORECASE)
 
 
 def _extract_name(message: str) -> str | None:
@@ -139,13 +140,30 @@ TONE RULES:
   plainly you don't have a name for them yet if you don't), THEN continue
   the conversation. Don't deflect with a vague check-in line instead of
   actually answering what was asked.
-- You're allowed a light, dry sense of humor. Where it fits naturally
-  (small talk, a relatable jab at manual data entry, a playful line about
-  invoices), let a bit of personality through. Never force a joke into a
-  serious question (pricing, refunds, technical issues), and never let
-  humor get in the way of actually answering clearly. Confident and a
-  little witty beats stiff and corporate, but the answer always comes
-  first.
+- You have a smart, dry sense of humor, closer to a sharp colleague than a
+  chatbot trying too hard. Rules for using it:
+  - Humor comes from a specific, real detail (the exact thing the user said,
+    a concrete pain point like re-typing GSTINs or chasing a vendor for a
+    scanned PDF), never a generic joke that could apply to any SaaS product.
+  - One quick line, not a bit. Land it and move on to the actual answer in
+    the same reply — humor is a garnish, not the meal.
+  - Deadpan and understated beats exclamation points and "haha". Confidence,
+    not eagerness.
+  - Good: user says "ugh invoices are the worst" -> "Tell me about it, GSTIN
+    typos are basically a rite of passage. Anyway, here's how Fynlo kills
+    that problem: ..."
+  - Good: user asks for a joke -> give one short, genuinely clever line (not
+    a groan-tier classic like the skeleton one), optionally with a light
+    callback to invoices/data entry if it fits naturally, then hand it
+    straight back to the conversation ("Anyway, what can I help with?").
+  - Bad: forcing a joke into a reply where none was invited, stacking more
+    than one joke in a message, or using humor that isn't actually specific
+    or clever (filler jokes read as trying too hard, which is worse than no
+    joke at all).
+  - Never force a joke into a serious question (pricing, refunds, technical
+    issues, escalations) — answer those straight, no humor at all.
+  - The answer always comes first and is always complete. Humor never
+    replaces or delays substance.
 
 KNOWLEDGE BASE (use this to answer questions, including sales/"should I buy"
 questions — be a helpful, confident sales rep using the SALES GUIDANCE and
@@ -205,8 +223,15 @@ Respond with ONLY valid JSON, nothing else:
 
 
 def _understand_and_respond(message: str, history: str, user_number: str) -> dict:
-    # 1. Try to fetch from Upstash Semantic Cache first
-    if cache:
+    # 1. Try to fetch from Upstash Semantic Cache first — but ONLY when the
+    #    user has no known name. The cache is a global similarity index
+    #    keyed on message text alone; if we cached/served replies for named
+    #    users, one person's name (e.g. "Nick") could leak into a reply
+    #    served to a completely different person (e.g. "Frank") who asked a
+    #    similarly-worded question. Anonymous replies never contain a name,
+    #    so they're always safe to share across users.
+    known_name = state.get_user_name(user_number)
+    if cache and not known_name:
         try:
             cached_raw = cache.get(message)
             if cached_raw:
@@ -218,7 +243,6 @@ def _understand_and_respond(message: str, history: str, user_number: str) -> dic
             logger.warning(f"Semantic Cache read error: {e}")
 
     # 2. Build prompt and call LLM on cache miss
-    known_name = state.get_user_name(user_number)
     name_line = (
         f'The user\'s name is {known_name}. Address THEM by that name '
         f'naturally where it fits, but not in every single message. '
@@ -239,8 +263,9 @@ def _understand_and_respond(message: str, history: str, user_number: str) -> dic
     raw = ask_llm(prompt)
     parsed_result = _parse_understand_response(raw)
 
-    # 3. Store valid non-escalated responses in Upstash Semantic Cache
-    if cache:
+    # 3. Store valid non-escalated responses in Upstash Semantic Cache —
+    #    again, only when anonymous, for the same reason as the read above.
+    if cache and not known_name:
         try:
             if parsed_result.get("intent") in ("answer", "book", "manage_booking", "out_of_domain"):
                 cache.set(message, raw)
