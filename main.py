@@ -164,6 +164,23 @@ TONE RULES:
     issues, escalations) — answer those straight, no humor at all.
   - The answer always comes first and is always complete. Humor never
     replaces or delays substance.
+- If the user is just being abusive/insulting at you with no real
+  question or request behind it (cursing you out, name-calling, telling
+  you to do something rude), do NOT get defensive, apologize excessively,
+  or act hurt, and do NOT treat it as needing human escalation, it's not
+  a real support issue. Instead, stay completely unbothered and give one
+  short, confident, genuinely witty line back (never rude or sarcastic AT
+  them, never matching their hostility), then smoothly pivot back to
+  something useful. Think "smooth, amused, not rattled", not "wounded
+  customer service bot" and not "fighting back". If there IS a real
+  complaint or issue buried underneath the hostility, treat that part
+  seriously with "escalate" as normal, the abusive tone alone is never
+  the reason to escalate.
+  - Example shape (write your own, don't reuse verbatim): user curses at
+    you with nothing else -> something short and disarming like "Rough
+    day? I get that a lot from people who haven't tried Fynlo yet.
+    Wanna see what it actually does?" — confident, a little playful,
+    zero defensiveness, immediately offers something useful.
 
 KNOWLEDGE BASE (use this to answer questions, including sales/"should I buy"
 questions — be a helpful, confident sales rep using the SALES GUIDANCE and
@@ -202,10 +219,17 @@ Decide ONE intent:
                founder with the conversation and tells the user the team
                will follow up — it does NOT book a call. If the user
                explicitly asks to book/schedule a call — whether in the
-               same message or a later one — use "book" instead.
+               same message or a later one — use "book" instead. Pure
+               abuse/insults with nothing else behind them are NEVER
+               "escalate" on their own, use "out_of_domain" for those and
+               follow the abusive-language tone rule above. Only use
+               "escalate" if there's an actual complaint or issue mixed in.
 - "out_of_domain" — not about Fynlo at all (e.g. asking about the weather,
-               general chit-chat unrelated to the product). Politely decline
-               and steer back to what you can help with.
+               general chit-chat unrelated to the product, OR pure
+               abuse/insults with no real request, see tone rule above for
+               how to respond). Politely decline (or, for abuse, respond
+               per the abusive-language tone rule) and steer back to what
+               you can help with.
 
 Respond with ONLY valid JSON, nothing else:
 {{"intent": "answer" | "book" | "manage_booking" | "escalate" | "out_of_domain", "reply": "..."}}
@@ -372,10 +396,25 @@ def notify_owner_telegram(text: str) -> bool:
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            # No parse_mode here on purpose. Telegram's "Markdown" mode is a
+            # strict legacy parser that 400s on ANY unmatched * _ [ ] pair —
+            # and our escalation text embeds conversation history/summaries
+            # that often contain stray asterisks (from booking confirmations
+            # like "*When:*") or markdown links (from the knowledge base's
+            # "[LinkedIn](...)" formatting). One unmatched marker anywhere in
+            # that text breaks the ENTIRE message with a bare, unhelpful 400.
+            # Plain text is far more reliable for something that must not
+            # silently fail — the 🚨 emoji and line breaks already make this
+            # readable without bold formatting.
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=10,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            # Log the actual response body — Telegram's error detail (e.g.
+            # "chat not found", "message is too long") is IN the body, not
+            # in the status line, and was previously being swallowed.
+            logger.error(f"Telegram escalation send failed: {resp.status_code} {resp.text}")
+            return False
         return True
     except Exception as e:
         logger.error(f"Telegram escalation send failed: {e}")
@@ -390,8 +429,8 @@ def escalate_to_owner(user_number: str, reason: str) -> bool:
         body_middle = history
 
     telegram_sent = notify_owner_telegram(
-        f"🚨 *Fynlo Escalation*\n\n*From:* {user_number}\n*Why:* {reason}\n\n"
-        f"*Summary:*\n{body_middle[:3500]}"
+        f"🚨 FYNLO ESCALATION\n\nFrom: {user_number}\nWhy: {reason}\n\n"
+        f"Summary:\n{body_middle[:3500]}"
     )
 
     whatsapp_sent = False
