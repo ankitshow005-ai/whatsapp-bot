@@ -350,6 +350,21 @@ import requests
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Loud and unmissable at startup, same pattern as the CORS log above. If
+# escalations never arrive on Telegram, this line in your Render logs
+# tells you immediately whether it's a missing/wrong env var (this log
+# will say "NOT configured") versus a real send failure (which logs
+# separately, per attempt, inside notify_owner_telegram below).
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    logger.info(f"Telegram escalation configured (chat_id={TELEGRAM_CHAT_ID})")
+else:
+    logger.warning(
+        "Telegram escalation NOT configured — TELEGRAM_BOT_TOKEN and/or "
+        "TELEGRAM_CHAT_ID env vars are missing. Escalations will silently "
+        "skip Telegram and only attempt WhatsApp (if configured). Set both "
+        "vars on Render → Environment to enable Telegram alerts."
+    )
+
 
 def notify_owner_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -448,18 +463,18 @@ def handle_message(message: str, user_number: str) -> str:
             logger.error(f"LLM provider quota/billing exhausted for {user_number}: {e}")
             escalate_to_owner(user_number, f"LLM provider quota/billing exhausted — bot is down: {err_str[:200]}")
             reply = (
-                "Sorry, I'm temporarily unable to answer questions, I've flagged this to our "
-                f"team. For anything urgent, please contact us directly here: {BOOKING_LINK}"
+                "Ah, I'm having a bit of a moment on my end, I've already flagged this to "
+                f"the team. If it's urgent, you can reach us directly here: {BOOKING_LINK}"
             )
         elif _RATE_LIMIT_HINT_RE.search(err_str):
             logger.warning(f"LLM rate-limited for {user_number}: {e}")
-            reply = "Sorry, I'm getting a lot of messages right now, mind trying again in a couple of minutes?"
+            reply = "Whew, busy in here right now! Give me a couple minutes and try again?"
         else:
             logger.error(f"Error handling message from {user_number}: {e}", exc_info=True)
             escalate_to_owner(user_number, f"Bot error: {e}")
             reply = (
-                "Sorry, I hit a snag answering that. I've flagged it to our team, "
-                f"for anything urgent, reach us directly here: {BOOKING_LINK}"
+                "Hmm, that one tripped me up. I've flagged it to the team, and if it's "
+                f"urgent, you can reach us directly here: {BOOKING_LINK}"
             )
     reply = _sanitize_reply(reply)
     state.add_turn(user_number, "bot", reply)
@@ -566,7 +581,7 @@ def _route(message: str, user_number: str) -> str:
                 sent = escalate_to_owner(user_number, result.get("reply") or message)
                 resume = _STEP_RESUME_HINT.get(step, "")
                 flag_note = (
-                    "I've flagged this to our team so they can look into it properly. "
+                    "Got it, flagged that for the team to dig into properly. "
                     if sent else
                     f"I'm having trouble reaching our team's alert system right now, for "
                     f"anything urgent, contact us directly here: {BOOKING_LINK}. "
@@ -584,7 +599,7 @@ def _route(message: str, user_number: str) -> str:
             if result["intent"] == "escalate":
                 sent = escalate_to_owner(user_number, result.get("reply") or message)
                 flag_note = (
-                    "I've flagged this to our team so they can look into it properly. "
+                    "Got it, flagged that for the team to dig into properly. "
                     if sent else
                     f"I'm having trouble reaching our team's alert system right now, for "
                     f"anything urgent, contact us directly here: {BOOKING_LINK}. "
@@ -692,11 +707,11 @@ def _route(message: str, user_number: str) -> str:
     sent = escalate_to_owner(user_number, result.get("reply") or message)
     if sent:
         return (
-            "Thanks for reaching out! This needs a closer look, I've flagged it to our "
-            "team and someone will get back to you shortly. 🙏 If you'd rather not wait, "
-            "I can also get a call on the calendar for you now, just say the word."
+            "Got it, flagged that for the team so they can take a proper look, someone "
+            "will follow up soon. If you'd rather not wait, I can get a call on the "
+            "calendar for you right now, just say the word."
         )
-    return f"Thanks for reaching out! I'm having trouble reaching our team's alert system right now, for anything urgent, please contact us directly here: {BOOKING_LINK}"
+    return f"Got it, though I'm having trouble reaching our team's alert system right now, for anything urgent, please contact us directly here: {BOOKING_LINK}"
 
 
 # ── Twilio webhook ────────────────────────────────────────
