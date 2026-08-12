@@ -767,7 +767,19 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
 async def chat(request: Request):
     data = await request.json()
     message = (data.get("message") or "").strip()
-    session_id = data.get("session_id") or "anonymous"
+    session_id = data.get("session_id")
+
+    if not session_id:
+        # No session id sent — this should not normally happen (the
+        # frontend generates one via sessionStorage), but if it ever does,
+        # NEVER fall back to a shared constant like "anonymous": that
+        # would collapse every visitor missing a session id into one
+        # shared identity, leaking one stranger's name/history to another.
+        # A fresh random id means this one request just won't have
+        # persistent memory, which is the safe failure mode.
+        import uuid
+        session_id = f"noid-{uuid.uuid4()}"
+        logger.warning("Chat request arrived with no session_id — generated a throwaway one")
 
     if not message:
         return {"reply": "Say something and I'll take a look!"}
