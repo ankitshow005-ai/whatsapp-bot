@@ -347,8 +347,12 @@ Q: Is setup difficult?
 A: No. Website states setup takes about 2 minutes.
 
 Q: Who founded Fynlo?
-A: Fynlo is founded and built by Ankit Show. You can connect with him on
-   LinkedIn: https://www.linkedin.com/in/showankit-ai-video-content-strategist/
+A: Fynlo is founded and actively built by Ankit Show, an AI and product
+   builder who's obsessed with turning the mess of manual invoice
+   processing into something that just works. He built the whole
+   pipeline himself, extraction, validation, ERP sync, the works, and he's
+   still shipping and improving it based on real user feedback. Want to
+   connect? Here's his [LinkedIn](https://www.linkedin.com/in/showankit-ai-video-content-strategist/).
 
 ========================
 OBJECTION HANDLING
