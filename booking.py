@@ -92,8 +92,8 @@ def attempt_booking(name: str, email: str, query: str, time_text: str) -> tuple[
             when = requested_time.astimezone(_LOCAL_TZ).strftime("%A, %d %b at %I:%M %p")
             return (
                 f"You're booked, {name}! 🎉\n\n"
-                f"*When:* {when} ({TIDYCAL_TIMEZONE})\n"
-                f"*Meeting link:* {booking.get('meeting_url') or '(check your email for the link)'}\n\n"
+                f"When: {when} ({TIDYCAL_TIMEZONE})\n"
+                f"Meeting link: {booking.get('meeting_url') or '(check your email for the link)'}\n\n"
                 f"A calendar invite is on its way to {email}. Need to reschedule or cancel "
                 f"later? Just tell me here.",
                 str(booking.get("id")) if booking.get("id") is not None else None,
@@ -140,7 +140,7 @@ def _suggest_alternatives(requested_time: datetime) -> str:
             by_day: dict[str, list[str]] = {}
             for s in local_window_slots:
                 by_day.setdefault(s.strftime("%A, %d %b"), []).append(s.strftime("%I:%M %p"))
-            lines = [f"*{day}:* {', '.join(times[:4])}" for day, times in by_day.items()]
+            lines = [f"{day}: {', '.join(times[:4])}" for day, times in by_day.items()]
             return (
                 "Here's what's open over the next few days:\n\n"
                 + "\n".join(lines)
@@ -187,8 +187,8 @@ def reschedule_flow(booking_id: str, name: str, email: str, time_text: str) -> t
             when = new_time.astimezone(_LOCAL_TZ).strftime("%A, %d %b at %I:%M %p")
             new_id = str(booking.get("id")) if booking.get("id") is not None else booking_id
             return (
-                f"Rescheduled! ✅\n\n*New time:* {when} ({TIDYCAL_TIMEZONE})\n"
-                f"*Meeting link:* {booking.get('meeting_url') or '(check your email)'}",
+                f"Rescheduled! ✅\n\nNew time: {when} ({TIDYCAL_TIMEZONE})\n"
+                f"Meeting link: {booking.get('meeting_url') or '(check your email)'}",
                 new_id,
             )
 

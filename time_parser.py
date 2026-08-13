@@ -39,6 +39,10 @@ Convert it into a clean, unambiguous date/time string in the format "YYYY-MM-DD 
 - Fix obvious typos (e.g. "thurday" means "Thursday", "tommorow" means "tomorrow").
 - If they gave a vague range ("afternoon", "after 2"), pick one reasonable exact
   time within it (afternoon -> 14:00, "after 2" -> 14:30, morning -> 10:00).
+- "after X" means strictly later than X, never exactly X, pick a small
+  reasonable offset past it (e.g. "after 2pm" -> 14:30, "after 5" -> 17:15).
+- "before X" means strictly earlier than X, never exactly X, pick a small
+  reasonable offset before it (e.g. "before 11am" -> 10:30, "before noon" -> 11:30).
 - If they gave just a day with no time, use 10:00 as the default.
 - If the text genuinely isn't a date/time at all (e.g. random words), reply with
   exactly the word UNKNOWN and nothing else.
@@ -47,6 +51,15 @@ Reply with ONLY the formatted string or UNKNOWN — no explanation, no extra wor
 
 
 import re
+
+# "after 2pm" / "before 11am" etc — dateparser silently DROPS this word and
+# returns the literal clock time (2:00pm exactly), not "sometime after
+# 2pm". That produced real booking bugs: a user asking for "after 2pm"
+# would get booked at exactly 2:00pm, or told 2:00pm wasn't free when a
+# later free slot the same day would have satisfied their actual request.
+# Force these through the LLM normalizer instead, which is explicitly
+# instructed above to apply a real offset.
+_RELATIVE_QUALIFIER_RE = re.compile(r"\b(after|before)\b", re.IGNORECASE)
 
 
 def _looks_like_bad_guess(text: str, result: datetime) -> bool:
@@ -69,12 +82,16 @@ def parse_preferred_time(text: str) -> datetime | None:
     Returns a timezone-aware datetime if a date/time could be parsed,
     otherwise None (caller should ask the user to rephrase).
     """
-    # Step 1: try the fast, free, no-API-call path first.
+    # Step 1: try the fast, free, no-API-call path first — but not for
+    # "after X" / "before X" phrasing, since dateparser drops that word
+    # entirely and returns the literal time X, not an offset from it.
     result = dateparser.parse(text, settings=_SETTINGS)
-    if result is not None and not _looks_like_bad_guess(text, result):
+    has_relative_qualifier = bool(_RELATIVE_QUALIFIER_RE.search(text))
+    if result is not None and not _looks_like_bad_guess(text, result) and not has_relative_qualifier:
         return result
     if result is not None:
-        logger.info(f"dateparser produced a suspicious result for '{text}' ({result}) — trying LLM instead")
+        reason = "relative qualifier ('after'/'before')" if has_relative_qualifier else "suspicious result"
+        logger.info(f"dateparser result for '{text}' ({result}) needs LLM normalization: {reason}")
 
     # Step 2: dateparser gave up — ask the LLM to clean up typos/vague
     # phrasing, then retry dateparser on its cleaned-up output.

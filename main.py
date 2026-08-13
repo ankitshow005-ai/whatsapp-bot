@@ -261,14 +261,7 @@ def _understand_and_respond(message: str, history: str, user_number: str) -> dic
             if cached_raw:
                 logger.info("Semantic Cache HIT! Bypassing LLM API call.")
                 parsed_cache = _parse_understand_response(cached_raw)
-                # Only "answer" (genuine, factual FAQ-style replies) is safe
-                # to cache and replay. "out_of_domain" replies include
-                # things like responses to hostility/off-topic messages,
-                # which need genuine, context-aware empathy each time, not
-                # a frozen canned line replayed to the next angry stranger
-                # who phrases things similarly. "book"/"manage_booking" are
-                # excluded too since their "reply" is always empty anyway.
-                if parsed_cache.get("intent") == "answer":
+                if parsed_cache.get("intent") in ("answer", "book", "manage_booking"):
                     return parsed_cache
         except Exception as e:
             logger.warning(f"Semantic Cache read error: {e}")
@@ -298,7 +291,7 @@ def _understand_and_respond(message: str, history: str, user_number: str) -> dic
     #    again, only when anonymous, for the same reason as the read above.
     if cache and not known_name:
         try:
-            if parsed_result.get("intent") == "answer":
+            if parsed_result.get("intent") in ("answer", "book", "manage_booking"):
                 cache.set(message, raw)
         except Exception as e:
             logger.warning(f"Semantic Cache write error: {e}")
@@ -542,6 +535,15 @@ _STOP_BOOKING_RE = re.compile(
     r"never\s?mind|forget\s+it|no\s+need|stop\b", re.IGNORECASE,
 )
 
+# Matches a bare "yes"/"same"/"that works" style reply, used when confirming
+# a name we already suggested (see _name_step_prompt below) rather than the
+# user typing a fresh name.
+_CONFIRM_RE = re.compile(
+    r"^\s*(yes+|yeah+|yep+|yup+|sure|same|that('?s| is)?\s*(fine|good|ok(ay)?|works)|"
+    r"correct|ok(ay)?)\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+
 _STEP_RESUME_HINT = {
     "name": "Anyway, what's your name?",
     "email": "Anyway, what email should the invite go to?",
@@ -558,6 +560,26 @@ def _maybe_inline_time(message: str):
     if not _TIME_HINT_RE.search(message):
         return None
     return parse_preferred_time(message)
+
+
+def _name_step_prompt(user_number: str, booking: dict) -> str:
+    """
+    If the person already told the bot their name earlier in this chat
+    (state.get_user_name — separate from state.get_last_customer, which is
+    only set after a PAST successful booking), don't blindly re-ask for a
+    name as if the bot forgot, and don't blindly assume the booking should
+    use it either, e.g. someone might be booking on behalf of a colleague.
+    Suggest it and let them confirm or override in one message.
+    """
+    chat_name = state.get_user_name(user_number)
+    if chat_name:
+        booking["_suggested_name"] = chat_name
+        booking["step"] = "name"
+        state.save_booking(user_number, booking)
+        return f"Should I book this under {chat_name}, or would you like to use a different name?"
+    booking["step"] = "name"
+    state.save_booking(user_number, booking)
+    return ask_for_name()
 
 
 def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | None = None) -> str:
@@ -659,9 +681,7 @@ def _route(message: str, user_number: str) -> str:
                     booking["step"] = "email"
                     state.save_booking(user_number, booking)
                     return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_email()
-                booking["step"] = "name"
-                state.save_booking(user_number, booking)
-                return flag_note + "In the meantime, let's get that call on the calendar. " + ask_for_name()
+                return flag_note + "In the meantime, let's get that call on the calendar. " + _name_step_prompt(user_number, booking)
 
             if booking.get("name") and booking.get("email"):
                 booking["step"] = "time"
@@ -671,12 +691,14 @@ def _route(message: str, user_number: str) -> str:
                 booking["step"] = "email"
                 state.save_booking(user_number, booking)
                 return ask_for_email()
-            booking["step"] = "name"
-            state.save_booking(user_number, booking)
-            return ask_for_name()
+            return _name_step_prompt(user_number, booking)
 
         if step == "name":
-            booking["name"] = message.strip()
+            suggested = booking.get("_suggested_name")
+            if suggested and _CONFIRM_RE.match(message.strip()):
+                booking["name"] = suggested
+            else:
+                booking["name"] = message.strip()
             if booking.get("email"):
                 booking["step"] = "time"
                 state.save_booking(user_number, booking)
@@ -774,19 +796,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
 async def chat(request: Request):
     data = await request.json()
     message = (data.get("message") or "").strip()
-    session_id = data.get("session_id")
-
-    if not session_id:
-        # No session id sent — this should not normally happen (the
-        # frontend generates one via sessionStorage), but if it ever does,
-        # NEVER fall back to a shared constant like "anonymous": that
-        # would collapse every visitor missing a session id into one
-        # shared identity, leaking one stranger's name/history to another.
-        # A fresh random id means this one request just won't have
-        # persistent memory, which is the safe failure mode.
-        import uuid
-        session_id = f"noid-{uuid.uuid4()}"
-        logger.warning("Chat request arrived with no session_id — generated a throwaway one")
+    session_id = data.get("session_id") or "anonymous"
 
     if not message:
         return {"reply": "Say something and I'll take a look!"}
