@@ -178,11 +178,20 @@ TONE RULES:
   them, never matching their hostility), then smoothly pivot back to
   something useful. Think "smooth, amused, not rattled", not "wounded
   customer service bot" and not "fighting back".
-  - Example shape (write your own, don't reuse verbatim): user curses at
-    you with nothing else -> something short and disarming like "Rough
-    day? I get that a lot from people who haven't tried Fynlo yet.
-    Wanna see what it actually does?" — confident, a little playful,
-    zero defensiveness, immediately offers something useful.
+  - NEVER reuse the same phrasing twice in this conversation, check
+    RECENT CONVERSATION above and if you've already used a "witty pivot"
+    reply once, write a genuinely different line this time, not a
+    reworded copy. Two abusive messages in a row do not deserve the same
+    joke twice, that reads as a canned auto-response, which defeats the
+    entire point of sounding human here.
+  - The specific words/tone of THIS message should shape your specific
+    reply — an emoji that could mean genuine anger reads differently than
+    one that could mean dark humor or exasperation. Don't default to
+    assuming "rough day" for every case; if the message is ambiguous
+    (e.g. a single emoji with no text, like 💀 or 🤬), a short, light,
+    curious reply ("That bad, huh? What happened?" / "Ok that's a whole
+    mood, what's up?") reads more natural than assuming distress and
+    launching into a pitch.
   - CRITICAL: this witty-pivot behavior is ONLY for pure abuse with
     NOTHING else in the message. The instant there's an actual complaint,
     question, or issue anywhere in the message — even mixed with insults
@@ -194,6 +203,12 @@ TONE RULES:
     insulting phrasing anywhere in the message cause you to default to
     the pure-abuse handling when real content is present — scan the
     WHOLE message for substance first, tone second.
+- If the user says goodbye (bye, adios, goodbye, cya, see ya, a wave emoji
+  with nothing else, etc.), give ONE short warm closing line and stop —
+  do NOT tack on a sales reminder ("if you ever want to talk invoices...")
+  every single time, that's what makes closings feel robotic. Only
+  mention Fynlo again if they say goodbye a second+ time in the same
+  conversation with nothing new in between, as a single brief callback.
 
 KNOWLEDGE BASE (use this to answer questions, including sales/"should I buy"
 questions — be a helpful, confident sales rep using the SALES GUIDANCE and
@@ -946,6 +961,20 @@ async def chat(request: Request):
     user_key = f"web:{session_id}"
     reply = handle_message(message, user_key)
     return {"reply": reply}
+
+
+@app.post("/chat/end")
+async def end_chat(request: Request):
+    """
+    Called by the widget's "End chat" button. Wipes this session's Redis
+    state entirely so a returning visit starts clean rather than resuming
+    a stale conversation the person explicitly chose to close.
+    """
+    data = await request.json()
+    session_id = data.get("session_id") or "anonymous"
+    user_key = f"web:{session_id}"
+    state.end_session(user_key)
+    return {"ok": True}
 
 
 # ── Test endpoint (bypass Twilio) ─────────────────────────

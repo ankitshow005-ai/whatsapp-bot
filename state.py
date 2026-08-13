@@ -115,6 +115,16 @@ def clear_booking(user_number: str) -> None:
     entry["booking"] = None
     _save(user_number, entry)
 
+def end_session(user_number: str) -> None:
+    """
+    Full reset for an explicit "end chat" action (web widget close button).
+    Deletes the whole Redis entry rather than just clearing booking, since
+    the point is a genuinely fresh start next time, not a half-cleared
+    state (old history, old name, orphaned active_booking_ids would all
+    otherwise survive a soft clear).
+    """
+    redis_client.delete(user_number)
+
 def set_last_booking_id(user_number: str, booking_id: str | None) -> None:
     """
     Sets the "current" booking id (used for cancel/reschedule shorthand)
