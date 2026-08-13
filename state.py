@@ -122,3 +122,11 @@ def set_last_booking_id(user_number: str, booking_id: str | None) -> None:
 
 def get_last_booking_id(user_number: str) -> str | None:
     return _get(user_number)["last_booking_id"]
+
+def set_last_escalated_at(user_number: str, timestamp: float) -> None:
+    entry = _get(user_number)
+    entry["last_escalated_at"] = timestamp
+    _save(user_number, entry)
+
+def get_last_escalated_at(user_number: str) -> float | None:
+    return _get(user_number).get("last_escalated_at")
