@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from fastapi import FastAPI, Request, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -359,6 +360,40 @@ def _summarize_for_escalation(history: str) -> str | None:
         return None
 
 
+_EMAIL_SINCERITY_PROMPT = """A user just gave this email address while booking a call: "{email}"
+
+Recent conversation for context:
+{history}
+
+Judge whether this looks like a real address the person actually wants a
+calendar invite sent to, or whether it's a joke/mocking/placeholder entry
+(this can be in any language, any style — sarcasm, insults, keyboard-mash,
+obviously fictional names, etc, not just specific English words). Use the
+conversation tone as context: e.g. if the user is clearly frustrated or
+messing with the bot right before giving the email, weigh that.
+
+Reply with ONLY one word: REAL or FAKE. No explanation."""
+
+
+def _email_seems_insincere(email: str, history: str) -> bool:
+    """
+    Regex/format validity says nothing about whether someone typed this
+    address for real vs. to mock the bot ("asshole@asshole.com",
+    "notgivingyouthis@fuckoff.io", etc, in any phrasing or language). A
+    fixed word list can't keep up with that, so this asks the LLM to make
+    the same judgment call a human would, using the actual conversation
+    tone as context. Fails open (treats as real) on any error, since a
+    false positive here just annoys a genuine customer with an extra
+    confirm — worse than letting a rare fake slip through.
+    """
+    try:
+        verdict = ask_llm(_EMAIL_SINCERITY_PROMPT.format(email=email, history=history)).strip().upper()
+        return verdict.startswith("FAKE")
+    except Exception as e:
+        logger.warning(f"Email sincerity check failed, assuming real: {e}")
+        return False
+
+
 import requests
 
 # ── Telegram escalation (free, no Twilio/WhatsApp API needed) ────────────
@@ -421,7 +456,24 @@ def notify_owner_telegram(text: str) -> bool:
         return False
 
 
+_ESCALATION_DEDUPE_SECONDS = 600  # 10 min — same conversation, don't double-ping the founder
+
+
 def escalate_to_owner(user_number: str, reason: str) -> bool:
+    # Same person can trip "escalate" twice in one flow — e.g. a general
+    # "connect me with the founder" gets classified as escalate, they say
+    # "sure" to booking a call instead, then the query step re-classifies
+    # their actual message ("to invest in Fynlo") as ALSO escalate-worthy.
+    # That's not two separate issues, it's one conversation — Ankit doesn't
+    # need two pings ten seconds apart for it. If we already escalated
+    # recently for this user, skip the second real notification but still
+    # tell the user it's flagged (from their side nothing looks different).
+    now = time.time()
+    last = state.get_last_escalated_at(user_number)
+    if last and (now - last) < _ESCALATION_DEDUPE_SECONDS:
+        logger.info(f"Skipping duplicate escalation for {user_number} (last one {now - last:.0f}s ago)")
+        return True
+
     reason = reason if len(reason) <= 300 else reason[:300] + "…"
     history = state.get_history_text(user_number)
     body_middle = _summarize_for_escalation(history)
@@ -467,6 +519,9 @@ def escalate_to_owner(user_number: str, reason: str) -> bool:
     if not telegram_sent and not whatsapp_sent:
         logger.error("Escalation failed on all channels (Telegram + WhatsApp)")
 
+    if telegram_sent or whatsapp_sent:
+        state.set_last_escalated_at(user_number, now)
+
     return telegram_sent or whatsapp_sent
 
 
@@ -494,6 +549,30 @@ def _sanitize_reply(text: str) -> str:
 
 def handle_message(message: str, user_number: str) -> str:
     state.add_turn(user_number, "user", message)
+    if _looks_hostile(message):
+        booking = state.get_booking(user_number)
+        if not booking:
+            # Not mid-flow — nothing useful to lose by fully stopping and
+            # de-escalating instead of letting the sales-forward LLM prompt
+            # pivot into a pitch.
+            reply = _sanitize_reply(_handle_hostility(user_number))
+            state.add_turn(user_number, "bot", reply)
+            return reply
+        # Mid-booking (name/email/time step): don't derail the flow just
+        # because the message has profanity in it — it may still contain
+        # the actual answer ("fuck up stupid I already told you my name").
+        # Let the normal step logic run (it's deterministic, not a sales
+        # prompt, so there's no pitch risk), just prepend a short
+        # acknowledgment so it doesn't read as if the tone was ignored.
+        try:
+            reply = _route(message, user_number)
+        except Exception as e:
+            logger.error(f"Error handling message from {user_number}: {e}", exc_info=True)
+            escalate_to_owner(user_number, f"Bot error: {e}")
+            reply = f"Hmm, that tripped me up, flagged to the team. Urgent? {BOOKING_LINK}"
+        reply = _sanitize_reply("Sorry about that, no worries. " + reply)
+        state.add_turn(user_number, "bot", reply)
+        return reply
     try:
         reply = _route(message, user_number)
     except Exception as e:
@@ -537,10 +616,13 @@ _STOP_BOOKING_RE = re.compile(
 
 # Matches a bare "yes"/"same"/"that works" style reply, used when confirming
 # a name we already suggested (see _name_step_prompt below) rather than the
-# user typing a fresh name.
+# user typing a fresh name. Also covers "I already told you" / "same as
+# before" style replies — those are a confirmation too, just phrased as
+# annoyance instead of "yes".
 _CONFIRM_RE = re.compile(
     r"^\s*(yes+|yeah+|yep+|yup+|sure|same|that('?s| is)?\s*(fine|good|ok(ay)?|works)|"
-    r"correct|ok(ay)?)\s*[!.]?\s*$",
+    r"correct|ok(ay)?)\s*[!.]?\s*$|"
+    r"(already\s+(told|said|gave)|same\s+as\s+before|i\s+said\s+(it|that)\s+already)",
     re.IGNORECASE,
 )
 
@@ -550,6 +632,48 @@ _STEP_RESUME_HINT = {
     "query": "Anyway, what would you like the call to be about?",
     "time": "Anyway, what day/time works for you?",
 }
+
+
+def _resume_hint_for(step: str, booking: dict) -> str:
+    """Same as _STEP_RESUME_HINT, but respects a pending name suggestion
+    instead of always asking a blank "what's your name?" when resuming."""
+    if step == "name":
+        suggested = booking.get("_suggested_name")
+        if suggested:
+            return f"Anyway, should I book this under {suggested}, or a different name?"
+    return _STEP_RESUME_HINT.get(step, "")
+
+
+# Catches swearing/insults directed at the bot or the situation in general.
+# Deliberately narrow (not just "no"/"stop") so normal cancellations like
+# "cancel it, I'm not free" never trip this — only actual hostility should.
+_HOSTILITY_RE = re.compile(
+    r"\b(f+u+c+k+|f\*+ck|sh+i+t+|bullsh\w*|stfu|shut\s*up|"
+    r"(you'?re|ur)\s+(useless|stupid|dumb|garbage|trash)|"
+    r"(worst|shit(ty)?|useless)\s+bot|hate\s+(you|this)|screw\s+you)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_hostile(message: str) -> bool:
+    return bool(_HOSTILITY_RE.search(message))
+
+
+def _handle_hostility(user_number: str) -> str:
+    """
+    A frustrated/hostile message should be met with a real de-escalation,
+    not a pivot into selling Fynlo — the old default routing let any
+    message (including "fuck off") fall through to the normal sales-forward
+    LLM prompt, which is why it kept replying with a pitch. This short-
+    circuits BEFORE any intent classification happens, so nothing about
+    the message gets "concluded" (booked, escalated, answered) while the
+    person is just venting.
+    """
+    return (
+        "Sorry, that's on me. No pitch, I'll just leave that there. If there's "
+        "something that actually went wrong I'd genuinely like to know, "
+        "otherwise no worries at all, I'll be here if you need anything."
+    )
 
 
 def _looks_like_digression(message: str) -> bool:
@@ -571,7 +695,10 @@ def _name_step_prompt(user_number: str, booking: dict) -> str:
     use it either, e.g. someone might be booking on behalf of a colleague.
     Suggest it and let them confirm or override in one message.
     """
-    chat_name = state.get_user_name(user_number)
+    # Prefer an already-stashed suggestion (set in _start_booking_flow from
+    # chat history) over re-deriving it, but fall back to state.user_name
+    # directly in case this got called from a path that never stashed one.
+    chat_name = booking.get("_suggested_name") or state.get_user_name(user_number)
     if chat_name:
         booking["_suggested_name"] = chat_name
         booking["step"] = "name"
@@ -621,8 +748,20 @@ def _start_booking_flow(user_number: str, message: str, rescheduling_id: str | N
         state.save_booking(user_number, booking)
         return "Sure, what name should the new booking be under?"
 
+    # NOTE: last_name here only ever comes from a PAST completed booking
+    # (state.get_last_customer). It says nothing about whether the person
+    # already told Jessy their name earlier in THIS chat (state.user_name),
+    # which is the far more common case and was being ignored entirely —
+    # that's why a fresh "Can we set up a call?" always fell through to a
+    # blank "what's your name?" later, even right after they'd already
+    # introduced themselves. Stash chat_name as the fallback candidate so
+    # the step="query" handler below (_name_step_prompt) has something to
+    # confirm against instead of asking cold.
+    chat_name = state.get_user_name(user_number)
     if last_name:
         booking["name"] = last_name
+    elif chat_name:
+        booking["_suggested_name"] = chat_name
     if last_email:
         booking["email"] = last_email
     booking["step"] = "query"
@@ -643,11 +782,11 @@ def _route(message: str, user_number: str) -> str:
         if step != "query" and _looks_like_digression(message):
             result = _understand_and_respond(message, state.get_history_text(user_number), user_number)
             if result["intent"] in ("answer", "out_of_domain"):
-                resume = _STEP_RESUME_HINT.get(step, "")
+                resume = _resume_hint_for(step, booking)
                 return f"{result['reply']}\n\n{resume}".strip()
             if result["intent"] == "escalate":
                 sent = escalate_to_owner(user_number, result.get("reply") or message)
-                resume = _STEP_RESUME_HINT.get(step, "")
+                resume = _resume_hint_for(step, booking)
                 flag_note = (
                     "Got it, flagged that for the team to dig into properly. "
                     if sent else
@@ -695,7 +834,7 @@ def _route(message: str, user_number: str) -> str:
 
         if step == "name":
             suggested = booking.get("_suggested_name")
-            if suggested and _CONFIRM_RE.match(message.strip()):
+            if suggested and _CONFIRM_RE.search(message.strip()):
                 booking["name"] = suggested
             else:
                 booking["name"] = message.strip()
@@ -713,6 +852,20 @@ def _route(message: str, user_number: str) -> str:
         if step == "email":
             if not is_valid_email(message.strip()):
                 return "That doesn't quite look like a valid email, mind double-checking it?"
+            if not booking.get("_email_confirmed_once") and _email_seems_insincere(
+                message.strip(), state.get_history_text(user_number)
+            ):
+                # Structurally fine but the LLM read it (with conversation
+                # tone as context) as a joke/mocking entry, not a real
+                # inbox. Ask once rather than silently booking a call whose
+                # invite will never arrive. The flag prevents an infinite
+                # loop if they genuinely mean to use it again.
+                booking["_email_confirmed_once"] = True
+                state.save_booking(user_number, booking)
+                return (
+                    f"Just checking, is {message.strip()} the email you actually want the "
+                    "invite sent to? If so, send it again and I'll lock it in."
+                )
             booking["email"] = message.strip()
             booking["step"] = "time"
             state.save_booking(user_number, booking)

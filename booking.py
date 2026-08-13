@@ -42,6 +42,10 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _LOCAL_TZ = zoneinfo.ZoneInfo(TIDYCAL_TIMEZONE)
 
 
+def is_valid_email(email: str) -> bool:
+    return bool(_EMAIL_RE.match(email.strip()))
+
+
 # ── Step prompts ────────────────────────────────────────────
 def ask_for_name() -> str:
     return "Happy to set that up! First, what's your name?"
@@ -63,10 +67,6 @@ def ask_for_time() -> str:
         "Perfect, last thing — what day/time works best for you? "
         "(e.g. \"tomorrow at 3pm\" or \"Friday morning\")"
     )
-
-
-def is_valid_email(email: str) -> bool:
-    return bool(_EMAIL_RE.match(email.strip()))
 
 
 # ── Booking attempt ─────────────────────────────────────────
