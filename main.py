@@ -88,6 +88,10 @@ else:
 
 _GREETING_RE = re.compile(r"^\s*(hi+|hello+|hey+|yo|sup|good\s*(morning|afternoon|evening)|namaste|hola)\s*[!.?]*\s*$", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"\b(cancel|scrap|drop)\b", re.IGNORECASE)
+_STATUS_QUERY_RE = re.compile(
+    r"\b(did you|have you|has it|is it|still|actually|really|check|verify|"
+    r"why.*(twice|two|double)|how many)\b", re.IGNORECASE,
+)
 _NAME_LEADIN_RE = re.compile(r"^\s*(?:i'?m|i am|it'?s|its|this is|my name'?s|my name is|name'?s|name is|call me)\s+", re.IGNORECASE)
 _NAME_TRAILING_RE = re.compile(r"\s+(?:here|speaking)\s*$", re.IGNORECASE)
 _NAME_TRAILING_RE = re.compile(r"\s+(?:here|speaking)\s*$", re.IGNORECASE)
@@ -173,15 +177,23 @@ TONE RULES:
   short, confident, genuinely witty line back (never rude or sarcastic AT
   them, never matching their hostility), then smoothly pivot back to
   something useful. Think "smooth, amused, not rattled", not "wounded
-  customer service bot" and not "fighting back". If there IS a real
-  complaint or issue buried underneath the hostility, treat that part
-  seriously with "escalate" as normal, the abusive tone alone is never
-  the reason to escalate.
+  customer service bot" and not "fighting back".
   - Example shape (write your own, don't reuse verbatim): user curses at
     you with nothing else -> something short and disarming like "Rough
     day? I get that a lot from people who haven't tried Fynlo yet.
     Wanna see what it actually does?" — confident, a little playful,
     zero defensiveness, immediately offers something useful.
+  - CRITICAL: this witty-pivot behavior is ONLY for pure abuse with
+    NOTHING else in the message. The instant there's an actual complaint,
+    question, or issue anywhere in the message — even mixed with insults
+    ("common sense is lacking", "why did you book me twice you idiot") —
+    that complaint is the real signal and takes over completely. Drop the
+    witty tone entirely, do not use the pivot line, and address the
+    complaint straight and seriously (as "escalate" if it needs a human,
+    or "manage_booking" if it's about an existing booking). Do not let
+    insulting phrasing anywhere in the message cause you to default to
+    the pure-abuse handling when real content is present — scan the
+    WHOLE message for substance first, tone second.
 
 KNOWLEDGE BASE (use this to answer questions, including sales/"should I buy"
 questions — be a helpful, confident sales rep using the SALES GUIDANCE and
@@ -213,7 +225,15 @@ Decide ONE intent:
                earlier pull a clear, explicit booking request back into
                "escalate" — the user asking again to book is a new,
                separate intent that should always be honored.
-- "manage_booking" — user wants to cancel or reschedule a call they ALREADY booked.
+- "manage_booking" — user wants to cancel or reschedule a call they ALREADY
+               booked, OR is asking a status/verification question about an
+               existing booking (e.g. "did you cancel it", "why did you book
+               me twice", "is my call still on", "do I have a booking").
+               NEVER answer these as "answer"/"out_of_domain" — you have NO
+               way to see real booking data in those branches and must not
+               guess. Route anything about the state of an existing booking
+               here so the app can check real records instead of you
+               inventing an answer.
 - "escalate" — genuinely needs a human: bugs, refunds, complaints, custom
                enterprise pricing negotiation, partnership requests, or
                anything you're truly not confident about. This alerts the
@@ -241,6 +261,11 @@ Respond with ONLY valid JSON, nothing else:
   Do NOT say "I am the official AI assistant" or similar, and do NOT sign
   off with your own name ("{bot}") or any name at all — just answer
   naturally, you don't need to re-introduce yourself or sign off.
+  CRITICAL: NEVER claim in an "answer"/"out_of_domain" reply that you
+  cancelled, confirmed, verified, rescheduled, or checked a real booking —
+  you have zero access to actual booking records in this branch, so any
+  such claim would be fabricated. If the user asks about an existing
+  booking's status in any way, that's "manage_booking", not "answer".
 - For "book" and "manage_booking": leave "reply" as an empty string — main.py
   handles the actual reply for these.
 - For "escalate": a short (1 sentence) internal note on WHY this needs a
@@ -549,31 +574,8 @@ def _sanitize_reply(text: str) -> str:
 
 def handle_message(message: str, user_number: str) -> str:
     state.add_turn(user_number, "user", message)
-    if _looks_hostile(message):
-        booking = state.get_booking(user_number)
-        if not booking:
-            # Not mid-flow — nothing useful to lose by fully stopping and
-            # de-escalating instead of letting the sales-forward LLM prompt
-            # pivot into a pitch.
-            reply = _sanitize_reply(_handle_hostility(user_number))
-            state.add_turn(user_number, "bot", reply)
-            return reply
-        # Mid-booking (name/email/time step): don't derail the flow just
-        # because the message has profanity in it — it may still contain
-        # the actual answer ("fuck up stupid I already told you my name").
-        # Let the normal step logic run (it's deterministic, not a sales
-        # prompt, so there's no pitch risk), just prepend a short
-        # acknowledgment so it doesn't read as if the tone was ignored.
-        try:
-            reply = _route(message, user_number)
-        except Exception as e:
-            logger.error(f"Error handling message from {user_number}: {e}", exc_info=True)
-            escalate_to_owner(user_number, f"Bot error: {e}")
-            reply = f"Hmm, that tripped me up, flagged to the team. Urgent? {BOOKING_LINK}"
-        reply = _sanitize_reply("Sorry about that, no worries. " + reply)
-        state.add_turn(user_number, "bot", reply)
-        return reply
     try:
+        reply = _route(message, user_number)
         reply = _route(message, user_number)
     except Exception as e:
         err_str = str(e)
@@ -622,6 +624,7 @@ _STOP_BOOKING_RE = re.compile(
 _CONFIRM_RE = re.compile(
     r"^\s*(yes+|yeah+|yep+|yup+|sure|same|that('?s| is)?\s*(fine|good|ok(ay)?|works)|"
     r"correct|ok(ay)?)\s*[!.]?\s*$|"
+    r"^\s*same\s*(name|one|as\s+before)?\s*[!.]?\s*$|"
     r"(already\s+(told|said|gave)|same\s+as\s+before|i\s+said\s+(it|that)\s+already)",
     re.IGNORECASE,
 )
@@ -642,38 +645,6 @@ def _resume_hint_for(step: str, booking: dict) -> str:
         if suggested:
             return f"Anyway, should I book this under {suggested}, or a different name?"
     return _STEP_RESUME_HINT.get(step, "")
-
-
-# Catches swearing/insults directed at the bot or the situation in general.
-# Deliberately narrow (not just "no"/"stop") so normal cancellations like
-# "cancel it, I'm not free" never trip this — only actual hostility should.
-_HOSTILITY_RE = re.compile(
-    r"\b(f+u+c+k+|f\*+ck|sh+i+t+|bullsh\w*|stfu|shut\s*up|"
-    r"(you'?re|ur)\s+(useless|stupid|dumb|garbage|trash)|"
-    r"(worst|shit(ty)?|useless)\s+bot|hate\s+(you|this)|screw\s+you)\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_hostile(message: str) -> bool:
-    return bool(_HOSTILITY_RE.search(message))
-
-
-def _handle_hostility(user_number: str) -> str:
-    """
-    A frustrated/hostile message should be met with a real de-escalation,
-    not a pivot into selling Fynlo — the old default routing let any
-    message (including "fuck off") fall through to the normal sales-forward
-    LLM prompt, which is why it kept replying with a pitch. This short-
-    circuits BEFORE any intent classification happens, so nothing about
-    the message gets "concluded" (booked, escalated, answered) while the
-    person is just venting.
-    """
-    return (
-        "Sorry, that's on me. No pitch, I'll just leave that there. If there's "
-        "something that actually went wrong I'd genuinely like to know, "
-        "otherwise no worries at all, I'll be here if you need anything."
-    )
 
 
 def _looks_like_digression(message: str) -> bool:
@@ -913,15 +884,33 @@ def _route(message: str, user_number: str) -> str:
         return _start_booking_flow(user_number, message)
 
     if intent == "manage_booking":
+        active_ids = state.get_active_booking_ids(user_number)
         booking_id = state.get_last_booking_id(user_number)
-        if not booking_id:
-            escalate_to_owner(user_number, "Wants to cancel/reschedule but no booking on file")
+
+        if not booking_id and not active_ids:
+            escalate_to_owner(user_number, "Wants to cancel/reschedule/check a booking but no booking on file")
             return "I don't have a booking on file for this number, I've flagged this to our team to sort out with you directly."
 
         if _CANCEL_RE.search(message):
             reply = cancel_flow(booking_id)
-            state.set_last_booking_id(user_number, None)
+            state.remove_active_booking_id(user_number, booking_id)
             return reply
+
+        if _STATUS_QUERY_RE.search(message):
+            # Ground this in what we actually know instead of letting the
+            # LLM invent a status/cancellation claim. This is exactly the
+            # gap that let the bot lie about cancelling a slot it never
+            # touched — real record count, not narrative.
+            if len(active_ids) > 1:
+                return (
+                    f"Straight answer: you actually have {len(active_ids)} bookings on file "
+                    f"right now (ids: {', '.join(active_ids)}), nothing's been auto-cancelled. "
+                    f"That's on me, want me to cancel one? Just tell me which."
+                )
+            return (
+                f"You have one active booking on file (id {booking_id}). "
+                f"Nothing else on record for this number."
+            )
 
         return _start_booking_flow(user_number, message, rescheduling_id=booking_id)
 

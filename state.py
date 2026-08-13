@@ -116,12 +116,40 @@ def clear_booking(user_number: str) -> None:
     _save(user_number, entry)
 
 def set_last_booking_id(user_number: str, booking_id: str | None) -> None:
+    """
+    Sets the "current" booking id (used for cancel/reschedule shorthand)
+    AND appends it to active_booking_ids so earlier bookings from the same
+    number aren't silently lost when a second one is made. Previously this
+    only tracked a single id, so booking #2 overwrote booking #1's id
+    entirely — the app had no memory the first booking existed, couldn't
+    cancel/verify it, yet nothing stopped the bot from later claiming it
+    had. Pass None to clear the "current" pointer (e.g. after a cancel)
+    without touching the active list.
+    """
     entry = _get(user_number)
     entry["last_booking_id"] = booking_id
+    if booking_id is not None:
+        active = entry.get("active_booking_ids") or []
+        if booking_id not in active:
+            active.append(booking_id)
+        entry["active_booking_ids"] = active
     _save(user_number, entry)
 
 def get_last_booking_id(user_number: str) -> str | None:
     return _get(user_number)["last_booking_id"]
+
+def get_active_booking_ids(user_number: str) -> list[str]:
+    return _get(user_number).get("active_booking_ids") or []
+
+def remove_active_booking_id(user_number: str, booking_id: str) -> None:
+    entry = _get(user_number)
+    active = entry.get("active_booking_ids") or []
+    if booking_id in active:
+        active.remove(booking_id)
+    entry["active_booking_ids"] = active
+    if entry.get("last_booking_id") == booking_id:
+        entry["last_booking_id"] = active[-1] if active else None
+    _save(user_number, entry)
 
 def set_last_escalated_at(user_number: str, timestamp: float) -> None:
     entry = _get(user_number)
