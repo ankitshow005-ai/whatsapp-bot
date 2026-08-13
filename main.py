@@ -261,7 +261,14 @@ def _understand_and_respond(message: str, history: str, user_number: str) -> dic
             if cached_raw:
                 logger.info("Semantic Cache HIT! Bypassing LLM API call.")
                 parsed_cache = _parse_understand_response(cached_raw)
-                if parsed_cache.get("intent") in ("answer", "book", "manage_booking", "out_of_domain"):
+                # Only "answer" (genuine, factual FAQ-style replies) is safe
+                # to cache and replay. "out_of_domain" replies include
+                # things like responses to hostility/off-topic messages,
+                # which need genuine, context-aware empathy each time, not
+                # a frozen canned line replayed to the next angry stranger
+                # who phrases things similarly. "book"/"manage_booking" are
+                # excluded too since their "reply" is always empty anyway.
+                if parsed_cache.get("intent") == "answer":
                     return parsed_cache
         except Exception as e:
             logger.warning(f"Semantic Cache read error: {e}")
@@ -291,7 +298,7 @@ def _understand_and_respond(message: str, history: str, user_number: str) -> dic
     #    again, only when anonymous, for the same reason as the read above.
     if cache and not known_name:
         try:
-            if parsed_result.get("intent") in ("answer", "book", "manage_booking", "out_of_domain"):
+            if parsed_result.get("intent") == "answer":
                 cache.set(message, raw)
         except Exception as e:
             logger.warning(f"Semantic Cache write error: {e}")
